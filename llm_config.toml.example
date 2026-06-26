@@ -1,0 +1,42 @@
+# ============================================================================
+# 神鹅语挖掘 LLM 配置
+# ============================================================================
+# 复制本文件为 llm_config.toml, 填入你自己的配置.
+#   cp llm_config.toml.example llm_config.toml
+#
+# 所有模型走 OpenAI 兼容 Chat Completions API (base_url + api_key).
+# 支持任何 OpenAI 兼容服务: OpenAI 官方 / DeepSeek / 智谱GLM / Together / vLLM 等.
+#
+# api_key 优先级: 本文件 [security] api_key > 环境变量 GOOSE_API_KEY.
+# 没有本文件时, 走 config.py 里的默认 (DeepSeek-V4 系列 + GLM-5.1 + Qwen3.7-Max).
+
+[security]
+base_url = "https://llmapi.paratera.com/v1"   # OpenAI 兼容端点 (含 /v1)
+api_key  = "sk-..."                           # 你的 key (别提交 llm_config.toml!)
+
+# ---- T1 通顺预筛 ----
+# 低成本模型, 关思考, 判候选两边通不通 (省 T2 全模型 token).
+[fluency]
+model = "DeepSeek-V4-Flash"
+thinking = false
+
+# ---- T2 关系评分 (神鹅语质量判定) ----
+# 多模型 cross-check: 取均分作 fitness, 任一模型 >= SCORE_THRESH(6) 入 gold.
+# 模型越多越准但越贵 (每候选 k 次调用). 建议 2-4 个强模型.
+# thinking=true 让 reasoning 模型走思维链 (更准但更慢更贵).
+[[score]]
+model = "DeepSeek-V4-Flash"
+thinking = true
+
+[[score]]
+model = "DeepSeek-V4-Pro"
+thinking = false
+
+[[score]]
+model = "Qwen3.7-Max"
+thinking = false
+
+[[score]]
+model = "GLM-5.1"
+thinking = false
+

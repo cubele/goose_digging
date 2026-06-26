@@ -1,0 +1,14 @@
+# 默认所有文本文件用 LF 换行 (跨平台一致)
+* text=auto eol=lf
+
+# 这些明确当文本
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+
+# 二进制数据/压缩包不当文本处理
+*.zip binary
+*.gz binary
+goose_digging/oracle/oracle.json binary

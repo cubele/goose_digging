@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goose-digging"
+version = "2.0.0"
+description = "「鳄鱼」字符转换器 + 神鹅语挖掘: 简体中文 -> EUC-JP/GBK 误读乱码, 及 LLM 辅助发掘神鹅语"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "goose" }]
+keywords = ["mojibake", "euc-jp", "gbk", "encoding", "简繁转换", "乱码", "神鹅语"]
+dependencies = [
+    "opencc-python-reimplemented",
+    "openai",
+    "wordfreq",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+# flat-layout: 包源码在 goose_digging/ 子目录, 项目根有 pyproject/README.
+[tool.setuptools.packages.find]
+include = ["goose_digging*"]
+
+# goose_oracle.json 是 goose_digging 包的运行时数据, 必须随包分发.
+[tool.setuptools.package-data]
+goose_digging = ["oracle/oracle.json", "data/*.txt"]
+
+[project.scripts]
+goose-digging = "goose_digging.mining.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["goose_digging/tests"]
