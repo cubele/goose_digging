@@ -205,6 +205,110 @@ class TestSampling:
         wm = extract_word_maps(pairs)
         assert {len(s) for s, _, _ in wm} == {2}
 
+    def test_load_seed_pairs_tolerates_blank_lines(self, tmp_path):
+        """load_seed_pairs 容忍空行 (末尾无换行/编辑残留, 无害)."""
+        sp = tmp_path / "scored.jsonl"
+        sp.write_text(
+            json.dumps({"left": "a", "right": "b", "dir": "fwd", "score": 8}) + "\n"
+            "\n"   # 空行
+            + json.dumps({"left": "c", "right": "d", "dir": "fwd", "score": 9}) + "\n",
+            encoding="utf-8")
+        from goose_digging.mining.seed import load_seed_pairs
+        pairs = load_seed_pairs(out_dir=tmp_path)
+        assert len(pairs) == 2   # 空行跳过, 2 条合法的都解析
+
+    def test_load_seed_pairs_fails_fast_on_bad_json(self, tmp_path):
+        """坏 JSON 行直接抛 (fail-fast): scored.jsonl 每行都该合法, 坏行=写盘 bug, 不能吞."""
+        import pytest
+        sp = tmp_path / "scored.jsonl"
+        sp.write_text(
+            json.dumps({"left": "a", "right": "b", "dir": "fwd", "score": 8}) + "\n"
+            "{这不是合法json\n",   # 坏行
+            encoding="utf-8")
+        from goose_digging.mining.seed import load_seed_pairs
+        with pytest.raises(json.JSONDecodeError):
+            load_seed_pairs(out_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# 2b. 惰性枚举 (enumerate.py: _LazyPairs, cursor 走词表, pair 现场算)
+# ---------------------------------------------------------------------------
+
+class TestLazyEnumeration:
+    def test_lazy_pairs_len_is_word_count(self):
+        """enumerate_pairs() 返回惰性序列, len() = 词表长度 (瞬间, 不算 pair)."""
+        from goose_digging.mining import enumerate as enum_mod
+        ep = enum_mod.enumerate_pairs()
+        n = len(ep)
+        assert n > 100000   # 词表百万级
+        # len 应等于 shuffled_words 长度
+        assert n == len(enum_mod._shuffled_words())
+
+    def test_lazy_getitem_returns_list_of_pairs(self):
+        """__getitem__(i) 返回第 i 个词的 pair 列表 (0-3 个, list[dict])."""
+        from goose_digging.mining import enumerate as enum_mod
+        ep = enum_mod.enumerate_pairs()
+        # 找一个产 pair 的词 (前 1000 词里必有)
+        found = False
+        for i in range(1000):
+            pairs = ep[i]
+            assert isinstance(pairs, list)
+            for p in pairs:
+                assert "left" in p and "right" in p and "dir" in p
+                assert p["dir"] in ("fwd", "rev", "fixed")
+            if pairs:
+                found = True
+                break
+        assert found, "前1000词没产出任何 pair"
+
+    def test_lazy_deterministic_across_instances(self):
+        """惰性序列跨实例确定: 两次 enumerate_pairs() 同索引产同样 pair (cursor 续跑基础)."""
+        from goose_digging.mining import enumerate as enum_mod
+        ep1 = enum_mod.enumerate_pairs()
+        ep2 = enum_mod.enumerate_pairs()
+        # 同索引 (词) 应产同样 pair (词表固定 seed shuffle, goose 是查表)
+        for i in [0, 100, 1000]:
+            assert ep1[i] == ep2[i], f"索引 {i} 跨实例不一致"
+
+    def test_lazy_bidict_pairs_both_in_dict(self):
+        """enumerate_both_in_dict() 的 pair: left 和 goose(left) 都在词典."""
+        from goose_digging.mining import enumerate as enum_mod
+        from goose_digging.oracle import goose
+        from goose_digging.mining.wordlist import load_static_dictionary
+        words = load_static_dictionary()
+        eb = enum_mod.enumerate_both_in_dict()
+        # 抽样前若干词, 验证产出的 pair 两边都在词典
+        checked = 0
+        for i in range(5000):
+            for p in eb[i]:
+                assert p["left"] in words
+                assert goose(p["left"]) == p["right"]
+                assert p["right"] in words
+                checked += 1
+                if checked >= 20:
+                    return
+        assert checked > 0, "前5000词没产 bidict pair"
+
+    def test_next_batch_handles_lazy_list_items(self):
+        """_next_batch 兼容惰性序列: __getitem__ 返回 list[dict] 时不崩, 正确取批."""
+        from goose_digging.mining import pipeline, state as st_mod
+        # 造假 lazy 序列: 每索引返回 list[dict] (模拟 _LazyPairs)
+        class FakeLazy:
+            def __init__(self, data):
+                self._d = data
+            def __len__(self):
+                return len(self._d)
+            def __getitem__(self, i):
+                return self._d[i]
+        # 每个索引 0-2 个 pair
+        data = [[{"left": f"a{i}", "right": f"b{i}", "dir": "fwd"}] if i % 2 == 0 else []
+                for i in range(10)]
+        lazy = FakeLazy(data)
+        st = st_mod.MiningState()
+        batch = pipeline._next_batch(st, lazy, 3, phase="bidict")
+        assert len(batch) == 3
+        assert st.cursor_bidict > 0
+
 
 # ---------------------------------------------------------------------------
 # 3. state 持久化

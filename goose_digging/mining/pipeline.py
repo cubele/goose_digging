@@ -44,16 +44,27 @@ def _set_cursor(state: MiningState, phase: str, val: int):
         state.cursor_full = val
 
 
-def _next_batch(state: MiningState, all_pairs: list[dict],
+def _next_batch(state: MiningState, all_pairs,
                 batch_size: int, phase: str = "bidict") -> list[dict]:
-    """从 all_pairs 取下一批未见 pair. cursor 按 phase 选 (bidict/full 独立)."""
+    """从 all_pairs 取下一批未见 pair. cursor 按 phase 选 (bidict/full 独立).
+
+    all_pairs 支持两种形态 (对调用方透明):
+      - 扁平 list[dict]: 每个索引一个 pair (测试/旧式)。
+      - 惰性 _LazyPairs: 每个索引 (词) 可能产 0-3 个 pair (fwd/rev/fixed),
+        __getitem__ 返回 list[dict]。cursor = 词索引, 跨 run 一致。
+    """
     cursor = _cursor_of(state, phase)
     batch = []
     while cursor < len(all_pairs) and len(batch) < batch_size:
-        p = all_pairs[cursor]
+        item = all_pairs[cursor]
         cursor += 1
-        if (p["left"], p["right"]) not in state.seen_pairs:
-            batch.append(p)
+        # 兼容两种形态: 单 dict (扁平 list) 或 list[dict] (lazy 词→pairs)
+        pairs = item if isinstance(item, list) else [item]
+        for p in pairs:
+            if (p["left"], p["right"]) not in state.seen_pairs:
+                batch.append(p)
+                if len(batch) >= batch_size:
+                    break
     _set_cursor(state, phase, cursor)
     return batch
 
@@ -209,7 +220,7 @@ def iterate_seed(client: openai.OpenAI, state: MiningState,
     from .config import SEED_MIN_SCORE, OUT_DIR as _DEFAULT_OUT
     stream = log.stream
     rnd = state.n_iter + 1
-    seed_pairs = seed_mod.load_seed_pairs(SEED_MIN_SCORE)
+    seed_pairs = seed_mod.load_seed_pairs(SEED_MIN_SCORE, out_dir=out_dir)
     # 全局已评 S (GA 专属): 防 GA 重新生成已评过的 S 烧 LLM.
     # 用 state.ga_seen_s 持久化 (跨 run 防重烧); evolve 原地往里加本 epoch 新评的 S.
     seen_s = set(state.ga_seen_s)

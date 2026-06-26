@@ -151,8 +151,15 @@ def load_seed_pairs(min_score: float | None = None,
     if not sp.exists():
         return []
     out = []
+    lineno = 0
     with sp.open(encoding="utf-8") as f:
         for line in f:
+            lineno += 1
+            line = line.strip()
+            if not line:
+                continue   # 空行容忍 (末尾无换行/编辑器残留, 无害)
+            # 坏 JSON 直接抛: scored.jsonl 每行都该是合法 JSON (_dump_scored 写的),
+            # 出现坏行 = 写盘出错/磁盘满/并发写, 必须立刻炸出来查根因, 不能吞。
             d = json.loads(line)
             if str(d.get("dir", "")).startswith("seed"):  # seed / seed_<model> 都排除
                 continue
