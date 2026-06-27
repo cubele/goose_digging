@@ -88,7 +88,7 @@ def extract_list(data, _depth: int = 0) -> list:
 def parse_json_list(raw: str, label: str = "") -> list:
     """解析 LLM 输出为 list. 兼容 [..] 和 {"results":[..]} 两种契约.
 
-    label: 调用阶段名 (如 "T2-score"), 解析失败时用于 stderr 警告定位.
+    label: 调用阶段名 (如 "评分"), 解析失败时用于 stderr 警告定位.
     失败仍返回 [] (不抛异常, 不炸调用方), 但会打可见警告, 避免 batch 全丢却无感知.
     """
     blob = find_json(raw)

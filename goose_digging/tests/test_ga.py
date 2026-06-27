@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""GA 神鹅语进化单测: 算子 / 种群多样性 / 两层适应度 / 端到端 evolve.
+"""GA 神鹅语进化纯单测: 算子 / 种群多样性 / 防同化 / 采样数学 / warm_start.
 
-全部 LLM 调用 mock, 全部纯函数/容器测试零外部依赖. evolve 端到端用 mock_llm 验证
-surrogate→promote 两层流程产物结构正确.
+不调 LLM (mock-LLM 集成测试见 test_e2e.py). 唯一例外是 test_scoring_failure
+(容错: 全模型打分失败时 epoch 不崩, 自带独立 mock 不依赖共享 fixture).
 """
 import random
 
 import pytest
 
-from goose_digging.mining.ga import genome, population, fitness, evolve
+from goose_digging.mining.ga import genome, population, evolve
 from goose_digging.mining.ga.genome import (
     Individual, crossover, mutate, immigrant, is_viable,
 )
@@ -34,32 +34,19 @@ WORD_SAMPLE = [("义父", "盗摄", 9.0), ("粪厂", "实境", 10.0),
 # ---------------------------------------------------------------------------
 
 class TestIndividual:
-    def test_raw_score_prefers_full_scores(self):
-        ind = Individual(s="义父", surrogate=4.0, scores=[8, 9])
-        assert ind.raw_score() == 8.5   # 全模型均分优先
-
-    def test_raw_score_falls_back_surrogate(self):
-        ind = Individual(s="义父", surrogate=7.0)
-        assert ind.raw_score() == 7.0
+    def test_raw_score_uses_full_scores(self):
+        ind = Individual(s="义父", scores=[8, 9])
+        assert ind.raw_score() == 8.5   # 全模型均分
 
     def test_raw_score_zero_when_unscored(self):
         assert Individual(s="x").raw_score() == 0.0
 
     def test_dict_roundtrip(self):
-        """to_dict/from_dict 往返: scores/born 保留; surrogate 已废弃不再序列化."""
-        ind = Individual(s="义父", surrogate=4.0, scores=[8, 9], born=3)
+        """to_dict/from_dict 往返: s/scores/born 保留."""
+        ind = Individual(s="义父", scores=[8, 9], born=3)
         ind2 = Individual.from_dict(ind.to_dict())
         assert ind2.s == "义父"
         assert ind2.scores == [8, 9] and ind2.born == 3
-        # surrogate 已废弃: to_dict 不再写它, 往返后为 None
-        assert ind2.surrogate is None
-
-    def test_from_dict_reads_legacy_surrogate(self):
-        """旧 state.json 含 surrogate 字段时 from_dict 不崩 (向后兼容读盘)."""
-        ind = Individual.from_dict({"s": "老串", "surrogate": 7.0, "scores": None, "born": 1})
-        assert ind.s == "老串"
-        assert ind.surrogate == 7.0   # 旧盘的 surrogate 读进来 (raw_score 会回退用它)
-        assert ind.raw_score() == 7.0  # scores 缺失时回退 surrogate
 
 
 # ---------------------------------------------------------------------------
@@ -67,11 +54,13 @@ class TestIndividual:
 # ---------------------------------------------------------------------------
 
 class TestOperators:
-    def test_crossover_length_within_bounds(self):
+    def test_crossover_respects_max_len(self):
+        # 过长截断到 max_len; 过短原样返回 (min_len 由 is_viable 预筛兜底, 不在算子里
+        # 靠重复末字硬凑 —— 旧版那样只造叠词垃圾). 只保证: 不超过 max_len, 全 CJK.
         rng = random.Random(7)
         for _ in range(50):
             child = crossover("义父盗摄", "通心看奶", 3, 9, rng)
-            assert 3 <= len(child) <= 9
+            assert len(child) <= 9
             assert all("\u4e00" <= c <= "\u9fff" for c in child)
 
     def test_crossover_substrings_from_parents(self):
@@ -104,6 +93,41 @@ class TestOperators:
         for _ in range(50):
             m = mutate("义父看奶挺住", CHAR_SAMPLE, WORD_SAMPLE, 3, 5, rng)
             assert len(m) <= 5
+
+    def test_clamp_len_does_not_pad_short_strings(self):
+        """_clamp_len 过短原样返回, 不再重复末字凑 min_len (旧版那样只造叠词垃圾).
+
+        过短串的丢弃交给 is_viable 预筛, 而不是在算子里硬塞叠字.
+        """
+        from goose_digging.mining.ga.genome import _clamp_len
+        # 过短: 原样返回, 没有重复末字补足
+        assert _clamp_len("义", 3, 9) == "义"
+        assert _clamp_len("义父", 3, 9) == "义父"
+        # 区间内: 不变
+        assert _clamp_len("义父盗", 3, 9) == "义父盗"
+        # 过长: 截断 (这条不变)
+        assert _clamp_len("义父盗摄通心厂", 3, 4) == "义父盗摄"
+        # 关键: 绝不产生末字重复
+        assert _clamp_len("义", 3, 9) != "义义义"
+
+    def test_mutate_does_not_manufacture_reduplication(self):
+        """变异算子不再有专门的"重复字"模式 (旧版 mode-4 17% 概率制造叠词).
+
+        残余的相邻重复只能是 char/word 替换碰巧撞出的巧合 (偶发, ~5%), 不该有
+        一个算子专门去造叠词 —— 因为 GA_FLUENCY_SYSTEM 正好杀叠词堆砌, 造了就是
+        白造 + 浪费 T1 token.
+        """
+        rng = random.Random(99)
+        s = "义父看奶挺"   # 5 个互不相同字, 杜绝"本来就有重复"干扰
+        manufactured = 0
+        n = 500
+        for _ in range(n):
+            m = mutate(s, CHAR_SAMPLE, WORD_SAMPLE, 3, 9, rng)
+            if any(m[i] == m[i + 1] for i in range(len(m) - 1)):
+                manufactured += 1
+        # 旧版 ~21% (mode-4 主导); 新版应 <10% (纯巧合). 留余量取 12%.
+        assert manufactured / n < 0.12, \
+            f"变异仍在大量造叠词: {manufactured}/{n} = {manufactured/n*100:.0f}%"
 
     def test_immigrant_produces_cjk_of_target_len(self):
         rng = random.Random(5)
@@ -164,18 +188,18 @@ class TestPopulation:
 
     def test_shared_fitness_dilutes_clustered(self):
         """聚集的相似个体被稀释: 同分但独处的分数应高于被簇拥的."""
-        lone = Individual(s="义父盗摄", surrogate=8.0)
+        lone = Individual(s="义父盗摄", scores=[8, 8])
         # 4 个和 lone 极相似的个体 (Levenshtein<=2) 围着它
-        cluster = [Individual(s="义父盗摄", surrogate=8.0),
-                   Individual(s="义父盗摄", surrogate=8.0)]
+        cluster = [Individual(s="义父盗摄", scores=[8, 8]),
+                   Individual(s="义父盗摄", scores=[8, 8])]
         sf_lone_in_cluster = shared_fitness(lone, [lone] + cluster, sigma=2.0)
         sf_lone_alone = shared_fitness(lone, [lone], sigma=2.0)
         assert sf_lone_in_cluster < sf_lone_alone   # 被簇稀释
 
     def test_dedupe_keeps_highest_score(self):
-        inds = [Individual(s="义父", surrogate=4.0),
+        inds = [Individual(s="义父", scores=[4, 4]),
                 Individual(s="义父", scores=[9, 9]),
-                Individual(s="通心", surrogate=7.0)]
+                Individual(s="通心", scores=[7, 7])]
         pop = Population(inds, pop_size=10, sigma=2.0, elite=1)
         assert len(pop) == 2   # 义父 去重
         by_s = {i.s: i for i in pop.to_list()}
@@ -251,7 +275,7 @@ class TestAntiHomogenization:
         pop = Population([
             Individual(s="已挖", scores=[7, 8]),    # max=8 >= 6, 已挖到
             Individual(s="未挖", scores=[2, 3]),    # max=3 < 6, 还在探索
-            Individual(s="待挖", surrogate=5.0),    # 未升级
+            Individual(s="待挖", scores=[5, 5]),    # 未到 gold 线
         ], pop_size=5, sigma=2.0, elite=0)
         from goose_digging.mining.config import GA_EVICT_SCORE_THRESH
         n = pop.evict(lambda ind: bool(ind.scores)
@@ -295,21 +319,6 @@ class TestAntiHomogenization:
 # ---------------------------------------------------------------------------
 
 class TestBugFixes:
-    def test_backbone_not_evicted(self):
-        """Bug A/B: 骨干用 surrogate 存(非 scores), evict gold 不误杀.
-        根因: 旧版骨干 scores=[int(score)], evict 看 max(scores)>=6 误杀高分骨干."""
-        from goose_digging.mining.config import GA_EVICT_SCORE_THRESH
-        # 骨干: surrogate=9 (高分, 但不是 scores)
-        backbone = Individual(s="骨干高分", surrogate=9.0, born=1)
-        promoted = Individual(s="成品", scores=[7, 8], born=1)  # 真 promoted
-        pop = Population([backbone, promoted], pop_size=5, sigma=2.0, elite=0)
-        n = pop.evict(lambda ind: bool(ind.scores)
-                      and max(ind.scores) >= GA_EVICT_SCORE_THRESH)
-        strs = {i.s for i in pop.to_list()}
-        assert n == 1                       # 只 evict 真 promoted
-        assert "骨干高分" in strs            # 骨干留存
-        assert "成品" not in strs
-
     def test_refill_factory_produces_only_viable(self):
         """Bug E: refill 工厂补的个体必须 viable (拒全不动点/生僻字).
         根因: 旧版 _immigrant_factory 不查 is_viable, 36% 产物是垃圾."""
@@ -328,27 +337,14 @@ class TestBugFixes:
         assert not bad, f"refill 补进垃圾: {[i.s for i in bad]}"
 
     def test_ga_seen_s_roundtrip(self, tmp_path):
-        """Bug H: ga_seen_s 持久化往返 (跨 run 防重烧 LLM).
-        根因: 旧版 surrogate-only S 不持久化, 跨 run 重新生成重烧 Flash."""
+        """Bug H: ga_seen_s 持久化往返 (跨 run 防重烧 LLM)."""
         from goose_digging.mining.state import MiningState
         sp = tmp_path / "state.json"
         st = MiningState()
-        st.ga_seen_s = ["义父", "通心", "只过surrogate的串"]
+        st.ga_seen_s = ["义父", "通心", "粪厂"]
         st.save(path=sp)
         st2 = MiningState.load(path=sp)
-        assert st2.ga_seen_s == ["义父", "通心", "只过surrogate的串"]
-
-    def test_ga_seen_s_old_state_compat(self, tmp_path):
-        """Bug H: 旧 state.json 无 ga_seen_s 时 load 不崩."""
-        import json
-        from goose_digging.mining.state import MiningState
-        sp = tmp_path / "old.json"
-        sp.write_text(json.dumps({
-            "seen_pairs": [], "gold_pairs": [], "n_iter": 0, "phase": "seed",
-            "cursor_bidict": 0, "cursor_full": 0,
-        }), encoding="utf-8")
-        st = MiningState.load(path=sp)
-        assert st.ga_seen_s == []
+        assert st2.ga_seen_s == ["义父", "通心", "粪厂"]
 
     def test_warm_start_no_infinite_loop(self):
         """Bug E 相关: warm_start 移民补满有重试上限, 不死循环.
@@ -372,7 +368,7 @@ class TestBugFixes:
     def test_scoring_failure_does_not_crash_epoch(self, monkeypatch):
         """Bug F: 全模型打分失败时不应让整个 epoch 崩.
         根因: 旧版 score_offspring 直接调 llm_chat, 失败抛异常冒泡到 iterate_seed 崩.
-        长时间挖掘时模型偶发故障很常见. T1 通顺预筛正常(默认全通), 全模型打分全失败."""
+        长时间挖掘时模型偶发故障很常见. 通顺预筛正常(默认全通), 全模型打分全失败."""
         from goose_digging.mining import pipeline, state as st_mod, config
         from goose_digging.mining.log import Logger
         from goose_digging.mining.llm import ModelLogger
@@ -385,7 +381,7 @@ class TestBugFixes:
 
         def fake_all_fail(client, model, system, user, **kw):
             raise RuntimeError(f"{model} 挂")
-        # T1 通顺判: 正常全通 (让候选进到全模型打分环节, 才能测打分失败)
+        # 通顺判: 正常全通 (让候选进到全模型打分环节, 才能测打分失败)
         def fake_fluency_ok(client, model, system, user, **kw):
             texts = _re.findall(r'\d+\. (.+)', user)
             items = ",".join(f'{{"text":"{t}","ok":true}}' for t in texts if t)
@@ -426,159 +422,29 @@ def _tmp_out_with_seeds():
 
 
 # ---------------------------------------------------------------------------
-# 5. 端到端 evolve (mock LLM)
+# 5. warm_start (纯函数, 不调 LLM): 种群从种子填充
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def ga_mock_llm(monkeypatch):
-    """mock scoring.llm_chat (全模型打分) + fluency.llm_chat (T1通顺预筛).
-    对含 '义' 的 left 打 9 (promote+gold), 否则 4. T1 默认全通 (不杀)."""
-    calls = {"score": [], "fluency": []}
-
-    def fake_score(client, model, system, user, **kw):
-        import re
-        lefts = re.findall(r'\d+\. (.+?) →', user)
-        parts = []
-        for L in lefts:
-            sc = 9 if "义" in L else 4
-            parts.append(f'{{"left":"{L}","score":{sc},"why":"测{model}"}}')
-        calls["score"].append(model)
-        return '{"scores":[' + ",".join(parts) + "]}"
-
-    def fake_fluency(client, model, system, user, **kw):
-        """T1 通顺判: 默认全通 (返回所有 text ok), 不杀任何候选.
-        个别测试需要杀可通过 calls['fluency_kill'] 控制."""
-        import re
-        texts = re.findall(r'\d+\. (.+)', user)
-        items = ",".join(f'{{"text":"{t}","ok":true}}' for t in texts if t)
-        calls["fluency"].append(1)
-        return '{"items":[' + items + "]}"
-
-    monkeypatch.setattr("goose_digging.mining.scoring.llm_chat", fake_score)
-    monkeypatch.setattr("goose_digging.mining.fluency.llm_chat", fake_fluency)
-    return calls
+_SEED_PAIRS = [
+    {"left": "义父", "right": "盗摄", "dir": "fwd", "score": 9.0},
+    {"left": "粪厂", "right": "实境", "dir": "fwd", "score": 10.0},
+    {"left": "通心", "right": "看奶", "dir": "fwd", "score": 8.0},
+    {"left": "挺住", "right": "尿住", "dir": "fwd", "score": 8.0},
+    {"left": "义父盗", "right": goose("义父盗"), "dir": "fwd", "score": 8.0},
+]
 
 
-@pytest.fixture
-def ga_seed_pairs():
-    """造假积木 (字映射 + 词映射 + 3字骨干)."""
-    return [
-        {"left": "义父", "right": "盗摄", "dir": "fwd", "score": 9.0},
-        {"left": "粪厂", "right": "实境", "dir": "fwd", "score": 10.0},
-        {"left": "通心", "right": "看奶", "dir": "fwd", "score": 8.0},
-        {"left": "挺住", "right": "尿住", "dir": "fwd", "score": 8.0},
-        {"left": "义父盗", "right": goose("义父盗"), "dir": "fwd", "score": 8.0},
-    ]
-
-
-class TestEvolve:
-    def test_warm_start_populates_from_seeds(self, ga_seed_pairs):
+class TestWarmStart:
+    def test_warm_start_populates_from_seeds(self):
         from goose_digging.mining.seed import extract_char_maps, extract_word_maps
         rng = random.Random(1)
-        chars = extract_char_maps(ga_seed_pairs)
-        words = extract_word_maps(ga_seed_pairs)
-        pop = evolve.warm_start(ga_seed_pairs, chars, words, 10, 1, rng)
+        chars = extract_char_maps(_SEED_PAIRS)
+        words = extract_word_maps(_SEED_PAIRS)
+        pop = evolve.warm_start(_SEED_PAIRS, chars, words, 10, 1, rng)
         assert len(pop) >= 1
         # 骨干含 3 字+ 种子里的 left 串 (warm_start 只留 SEED_MIN_LEN=3 字以上骨干)
         pop_strs = {i.s for i in pop.to_list()}
         assert "义父盗" in pop_strs
-
-    def test_evolve_returns_epoch_result_structure(self, ga_mock_llm, ga_seed_pairs):
-        """evolve 一个 epoch: 返回 GAEpochResult, 结构完整."""
-        from goose_digging.mining.seed import extract_char_maps, extract_word_maps
-        chars = extract_char_maps(ga_seed_pairs)
-        words = extract_word_maps(ga_seed_pairs)
-        rng = random.Random(42)
-        result = evolve.evolve(
-            client=None, seed_pairs=ga_seed_pairs, all_chars=chars, all_words=words,
-            n_gen=20, rnd=1, logger=lambda s: None, debug_writer=None,
-            model_loggers=None, existing_population=None, existing_epoch=0, rng=rng)
-        # 结构 (单层全模型打分: 无 sentences/promoted, 有 findings/gold_hits/per_pair)
-        assert result.gen_model == "seed_ga"
-        assert isinstance(result.findings, list)
-        assert isinstance(result.gold_hits, list)
-        assert isinstance(result.per_pair, dict)
-        assert isinstance(result.pop, list) and len(result.pop) > 0
-        assert result.stats.get("offspring", 0) > 0
-        assert result.stats.get("scored", 0) >= 0   # 打分条数
-        # 种群个体有序列化字段
-        for d in result.pop[:3]:
-            assert "s" in d
-
-    def test_evolve_scores_all_offspring(self, ga_mock_llm, ga_seed_pairs):
-        """单层架构: 所有 offspring 都被全模型打分 (含'义'的得9, 进 gold)."""
-        from goose_digging.mining.seed import extract_char_maps, extract_word_maps
-        chars = extract_char_maps(ga_seed_pairs)
-        words = extract_word_maps(ga_seed_pairs)
-        # 用固定种子 + 大 n_gen 增加含 '义' 候选出现概率
-        rng = random.Random(7)
-        result = evolve.evolve(
-            client=None, seed_pairs=ga_seed_pairs, all_chars=chars, all_words=words,
-            n_gen=60, rnd=1, logger=lambda s: None, debug_writer=None,
-            model_loggers=None, existing_population=None, existing_epoch=0, rng=rng)
-        # findings 非空 (全模型打了分), 含 '义' 的候选进了 gold (mock 给9分)
-        assert len(result.findings) > 0
-        if any("义" in f.S for f in result.findings):
-            assert any("义" in gh["pair"].split("→")[0] for gh in result.gold_hits)
-        # 全模型打分调过
-        assert len(ga_mock_llm["score"]) >= 1
-
-    def test_evolve_persists_population_for_resume(self, ga_mock_llm, ga_seed_pairs):
-        """evolve 返回的 pop 可作为下轮 existing_population (断点续)."""
-        from goose_digging.mining.seed import extract_char_maps, extract_word_maps
-        chars = extract_char_maps(ga_seed_pairs)
-        words = extract_word_maps(ga_seed_pairs)
-        rng1 = random.Random(1)
-        r1 = evolve.evolve(None, ga_seed_pairs, chars, words, 20, 1,
-                           lambda s: None, None, existing_population=None,
-                           existing_epoch=0, rng=rng1)
-        # 第二轮用第一轮的种群续传
-        rng2 = random.Random(2)
-        r2 = evolve.evolve(None, ga_seed_pairs, chars, words, 20, 2,
-                           lambda s: None, None, existing_population=r1.pop,
-                           existing_epoch=1, rng=rng2)
-        assert len(r2.pop) > 0
-        assert r2.stats.get("offspring", 0) > 0
-
-    def test_seen_s_prevents_reevaluation(self, ga_mock_llm, ga_seed_pairs):
-        """全局 seen_s: 已评过的 S 不再进全模型打分 (不重复烧 LLM)."""
-        from goose_digging.mining.seed import extract_char_maps, extract_word_maps
-        chars = extract_char_maps(ga_seed_pairs)
-        words = extract_word_maps(ga_seed_pairs)
-        # 第一轮: 跑完, seen_s 累积了本 epoch 评过的所有 S
-        seen_s = set()
-        r1 = evolve.evolve(None, ga_seed_pairs, chars, words, 30, 1,
-                           lambda s: None, None, existing_population=None,
-                           existing_epoch=0, seen_s=seen_s, rng=random.Random(1))
-        n_scored_epoch1 = len(seen_s)
-        assert n_scored_epoch1 > 0   # 至少评过几个
-
-        # 第二轮: 种群里所有 S 都已在 seen_s (它们上一轮被评过). 续传后这些骨干不再
-        # 重评. 用同样的 seed 保证 offspring 部分撞上 seen_s.
-        calls_before = len(ga_mock_llm["score"])
-        r2 = evolve.evolve(None, ga_seed_pairs, chars, words, 30, 2,
-                           lambda s: None, None, existing_population=r1.pop,
-                           existing_epoch=1, seen_s=seen_s, rng=random.Random(1))
-        # seen_s 持续增长 (第二轮新评的 S 也加进去)
-        assert len(seen_s) >= n_scored_epoch1
-
-    def test_evict_gold_removes_gold_individuals_from_population(self, ga_mock_llm, ga_seed_pairs):
-        """全模型 max>=SCORE_THRESH(gold) 的个体被 evict 出种群: 既存档就不该再占.
-        单层架构下所有 offspring 都被全模型打分, 但只有 gold(>=6)的才 evict."""
-        from goose_digging.mining.seed import extract_char_maps, extract_word_maps
-        from goose_digging.mining.config import GA_EVICT_SCORE_THRESH
-        chars = extract_char_maps(ga_seed_pairs)
-        words = extract_word_maps(ga_seed_pairs)
-        rng = random.Random(7)
-        r = evolve.evolve(None, ga_seed_pairs, chars, words, 60, 1,
-                          lambda s: None, None, existing_population=None,
-                          existing_epoch=0, rng=rng)
-        # gold 个体 (max(scores)>=GA_EVICT_SCORE_THRESH) 不应在最终种群里 (被 evict)
-        gold_s = {gh["pair"].split("→")[0] for gh in r.gold_hits}
-        if gold_s:
-            pop_s = {d["s"] for d in r.pop}
-            leftover = gold_s & pop_s
-            assert not leftover, f"gold 个体未 evict: {leftover}"
 
 
 # ---------------------------------------------------------------------------
@@ -616,114 +482,31 @@ class TestUniformBoostSampling:
         assert min(sampled_freqs) <= 5, "低频字映射没被采到"
         assert max(sampled_freqs) >= 40, "高频字映射没被采到"
 
-    def test_ga_config_params_widened(self):
-        """GA 参数已调宽 (广泛覆盖、持久探索目标)."""
+    def test_ga_config_params_scaled(self):
+        """GA 参数按真实预筛接受率 (~4-8%) scale 到每 epoch 打分 ~12.
+
+        约束: offspring x viable留存 x 去重留存 x 接受率 ≈ 打分数.
+        8% 端: 220x0.82x0.85x0.08 ≈ 12 打分, 替换率 ~12% (健康稳态).
+        4% 端: ≈6 打分, 替换率 ~6% (不停滞).
+        IMMIGRANT+CROSSOVER+MUTATION=1.0 (evolve._gen_offspring 硬约束).
+        """
         from goose_digging.mining import config
-        assert config.GA_POP_SIZE >= 60        # 种群更大
-        assert config.GA_IMMIGRANT_RATE >= 0.40  # 更多移民
-        assert config.GA_ELITE <= 1            # 精英更少 (防收敛)
-        assert config.GA_MAX_AGE <= 5          # aging 更激进
-        assert config.GA_SHARING_SIGMA >= 2.5  # sharing 邻域放宽
+        # offspring 够支撑真实低接受率下的打分 (8%x0.82x0.85xoff ≈ 12)
+        assert config.GA_OFFSPRING_PER_EPOCH >= 200
+        # 稳态替换率健康 (offspring存活/pop 不超 25%, 防大换血)
+        assert config.GA_POP_SIZE >= 80
+        assert config.GA_OFFSPRING_PER_EPOCH * 0.82 * 0.85 * 0.08 / config.GA_POP_SIZE <= 0.25
+        # 精英少 (防收敛)
+        assert config.GA_ELITE <= 1
+        # age 与 pop 同步放大 (给个体多代被验证, 对冲大流入)
+        assert config.GA_MAX_AGE >= 5
+        # rate 和 = 1.0
+        assert abs(config.GA_IMMIGRANT_RATE + config.GA_CROSSOVER_RATE
+                   + config.GA_MUTATION_RATE - 1.0) < 1e-9
+        # sharing 邻域放宽
+        assert config.GA_SHARING_SIGMA >= 2.5
         # boost 采样参数存在且小 (近均匀)
         assert hasattr(config, "SEED_BOOST_ALPHA")
         assert 0 < config.SEED_BOOST_ALPHA <= 0.2
         assert hasattr(config, "GA_IMMIGRANT_BOOST_ALPHA")
         assert 0 < config.GA_IMMIGRANT_BOOST_ALPHA <= 0.2
-
-
-# ---------------------------------------------------------------------------
-# 6. T1 通顺预筛 (不通顺的杀掉再喂全模型, 省 token)
-# ---------------------------------------------------------------------------
-
-class TestT1FluencyPrefilter:
-    def test_t1_kills_unfluent_both_sides_must_pass(self, monkeypatch):
-        """T1 两边都通才进全模型: 左或右边不通的都杀.
-        神鹅语必须两边都是人话形成反差 (吊挺吗→倪尿妈), 单边通的不算."""
-        from goose_digging.mining.seed import extract_char_maps, extract_word_maps
-        from goose_digging.oracle import goose
-        import re as _re
-        calls = {"score_lefts": []}
-
-        # fluency: 标含'垃圾'的不通, 其余通 (左右都判)
-        def fake_fluency(client, model, system, user, **kw):
-            texts = _re.findall(r'\d+\. (.+)', user)
-            items = ",".join(f'{{"text":"{t}","ok":{str("垃圾" not in t).lower()}}}'
-                             for t in texts if t)
-            return '{"items":[' + items + "]}"
-
-        def fake_score(client, model, system, user, **kw):
-            lefts = _re.findall(r'\d+\. (.+?) →', user)
-            calls["score_lefts"].extend(lefts)
-            parts = [f'{{"left":"{L}","score":9,"why":"x"}}' for L in lefts]
-            return '{"scores":[' + ",".join(parts) + "]}"
-
-        monkeypatch.setattr("goose_digging.mining.fluency.llm_chat", fake_fluency)
-        monkeypatch.setattr("goose_digging.mining.scoring.llm_chat", fake_score)
-
-        ga_seed = [{"left": "义父盗", "right": goose("义父盗"), "dir": "fwd", "score": 9.0}]
-        chars = extract_char_maps(ga_seed)
-        words = extract_word_maps(ga_seed)
-        r = evolve.evolve(None, ga_seed, chars, words, 40, 1, lambda s: None, None,
-                          existing_population=None, existing_epoch=0, rng=random.Random(1))
-        # 被全模型打分的候选: 左和右都不含'垃圾'(两边都通才进来)
-        scored = set(calls["score_lefts"])
-        assert not any("垃圾" in s for s in scored)
-
-    def test_t1_uses_lenient_ga_prompt_not_strict(self, monkeypatch):
-        """GA 的 T1 用 GA_FLUENCY_SYSTEM (宽松), 不是枚举路径的严格 FLUENCY_SYSTEM.
-        验证: evolve 调 fluency_filter 时传了宽松 prompt (放行谐音/联想/口语)."""
-        from goose_digging.mining.seed import extract_char_maps, extract_word_maps
-        from goose_digging.oracle import goose
-        from goose_digging.mining.prompts import GA_FLUENCY_SYSTEM, FLUENCY_SYSTEM
-        import re as _re
-        seen_systems = []
-
-        def fake_fluency(client, model, system, user, **kw):
-            seen_systems.append(system)
-            texts = _re.findall(r'\d+\. (.+)', user)
-            items = ",".join(f'{{"text":"{t}","ok":true}}' for t in texts if t)
-            return '{"items":[' + items + "]}"
-
-        def fake_score(client, model, system, user, **kw):
-            lefts = _re.findall(r'\d+\. (.+?) →', user)
-            parts = [f'{{"left":"{L}","score":4,"why":"x"}}' for L in lefts]
-            return '{"scores":[' + ",".join(parts) + "]}"
-
-        monkeypatch.setattr("goose_digging.mining.fluency.llm_chat", fake_fluency)
-        monkeypatch.setattr("goose_digging.mining.scoring.llm_chat", fake_score)
-
-        ga_seed = [{"left": "义父盗", "right": goose("义父盗"), "dir": "fwd", "score": 9.0}]
-        chars = extract_char_maps(ga_seed)
-        words = extract_word_maps(ga_seed)
-        evolve.evolve(None, ga_seed, chars, words, 20, 1, lambda s: None, None,
-                      existing_population=None, existing_epoch=0, rng=random.Random(1))
-        # T1 用的是宽松 GA prompt, 不是严格的枚举 prompt
-        assert any(GA_FLUENCY_SYSTEM in s for s in seen_systems), \
-            "GA 应传 GA_FLUENCY_SYSTEM"
-        assert GA_FLUENCY_SYSTEM != FLUENCY_SYSTEM, "两个 prompt 不能一样(否则宽松失效)"
-
-    def test_t1_stats_reports_killed(self, monkeypatch):
-        """stats 里有 t1_killed 字段."""
-        from goose_digging.mining.seed import extract_char_maps, extract_word_maps
-        from goose_digging.oracle import goose
-        import re as _re
-
-        def fake_fluency(client, model, system, user, **kw):
-            texts = _re.findall(r'\d+\. (.+)', user)
-            items = ",".join(f'{{"text":"{t}","ok":true}}' for t in texts if t)
-            return '{"items":[' + items + "]}"
-
-        def fake_score(client, model, system, user, **kw):
-            lefts = _re.findall(r'\d+\. (.+?) →', user)
-            parts = [f'{{"left":"{L}","score":4,"why":"x"}}' for L in lefts]
-            return '{"scores":[' + ",".join(parts) + "]}"
-
-        monkeypatch.setattr("goose_digging.mining.fluency.llm_chat", fake_fluency)
-        monkeypatch.setattr("goose_digging.mining.scoring.llm_chat", fake_score)
-
-        ga_seed = [{"left": "义父盗", "right": goose("义父盗"), "dir": "fwd", "score": 9.0}]
-        chars = extract_char_maps(ga_seed)
-        words = extract_word_maps(ga_seed)
-        r = evolve.evolve(None, ga_seed, chars, words, 20, 1, lambda s: None, None,
-                          existing_population=None, existing_epoch=0, rng=random.Random(1))
-        assert "t1_killed" in r.stats

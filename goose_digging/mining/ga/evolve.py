@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""稳态 GA 主循环 (单层全模型打分, 废弃 surrogate).
+"""稳态 GA 主循环 (单层全模型打分).
 
 每个 epoch (= 一次 iterate_seed 调用产 n_gen 个候选) 的步骤:
   1. warm_start: 种群为空时, 从 scored.jsonl 高分对的 left 串 + 近均匀采样移民补满
@@ -9,7 +9,6 @@
        mutation   GA_MUTATION_RATE    字映射替换/重采/删/重复 (余下比例)
   3. 廉价预筛 is_viable (零 LLM): 砍全不动点/已见/生僻字乱码
   4. 全模型 score_pairs 直接打分 (4 模型 cross-check) → fitness = 全模型均分
-     (废弃旧 surrogate 两层架构: 单模型 Flash 曾导致进化朝 Flash 偏好收敛)
   5. crowding 替换入种群, 更新 fitness-sharing
   6. evict gold: 全模型 max>=SCORE_THRESH 的个体存档后移出种群
   7. 早熟监控: mean_diversity 过低则下 epoch 抬 immigrant_rate (震荡)
@@ -20,7 +19,7 @@
 
 设计要点:
   - 种群跨 epoch 持久 (state.ga_population), warm_start 只在首次/种群空时做.
-  - fitness = 全模型均分 (findings 里直接有), 不再依赖不可靠的单模型 surrogate.
+  - fitness = 全模型均分 (findings 里直接有).
   - GA 参数调宽 (POP=60/IMMIGRANT=0.40/ELITE=1/MAX_AGE=4/SHARING=2.5): 广泛覆盖、持久探索.
 """
 from __future__ import annotations
@@ -36,7 +35,7 @@ from ..config import (
     GA_POP_SIZE, GA_OFFSPRING_PER_EPOCH, GA_IMMIGRANT_RATE, GA_CROSSOVER_RATE,
     GA_MUTATION_RATE, GA_TOURNAMENT_K, GA_ELITE, GA_SHARING_SIGMA,
     GA_IMMIGRANT_BOOST_ALPHA, SEED_MIN_LEN, SEED_MAX_LEN,
-    SEED_MIN_SCORE, SEED_N_CHARS, SEED_N_WORDS, SEED_BOOST_ALPHA,
+    SEED_N_CHARS, SEED_N_WORDS, SEED_BOOST_ALPHA,
     WORD_MAP_LEN, SCORE_THRESH, GA_MAX_AGE, GA_EVICT_PROMOTED,
     GA_EVICT_SCORE_THRESH, GA_SCORE_BATCH,
 )
@@ -62,7 +61,7 @@ def warm_start(seed_pairs: list[dict], all_chars, all_words,
                pop_size: int, epoch: int, rng: random.Random) -> Population:
     """构造初始种群: scored.jsonl 高分对的 left 串做骨干 + 近均匀采样移民补满.
 
-    seed_pairs: load_seed_pairs 的结果 (score>=SEED_MIN_SCORE 的 pair).
+    seed_pairs: load_seed_pairs 的结果 (全部枚举 pair, 不卡分数).
     all_chars/all_words: extract_char_maps/extract_word_maps 结果 (积木).
     骨干用 left 串 (已有验证过的鹅语碎片), 去掉全不动点 (is_viable 会过).
     骨干的 fitness 用其历史 score 存进 scores 字段 (作为进化起点的初始 fitness).
@@ -239,7 +238,7 @@ def evolve(client: openai.OpenAI,
                              [ind.to_dict() for ind in pop.to_list()],
                              {"offspring": len(offspring), "scored": 0, "gold": 0})
 
-    # 3b. T1 通顺预筛 (Flash 关思考, 成本低): 两边都通才进全模型, 省 4x token.
+    # 3b. 通顺预筛 (便宜模型关思考, 成本低): 两边都通才进全模型, 省 4x token.
     #     GA 产物多为字映射随机拼, 大量"左边或右边读不通/堆砌"的串, 喂全模型=烧钱.
     #     复用 fluency.fluency_filter (两边都通才存活, 词典优先省 LLM).
     #     用 GA 专属宽松 prompt (GA_FLUENCY_SYSTEM): GA 候选本是谐音/联想/口语拼串,
@@ -247,21 +246,21 @@ def evolve(client: openai.OpenAI,
     from ..fluency import fluency_filter
     from ..prompts import GA_FLUENCY_SYSTEM
     fluency_pairs = [{"left": ind.s, "right": goose(ind.s)} for ind in dedup]
-    n_before_t1 = len(fluency_pairs)
+    n_before_fluency = len(fluency_pairs)
     survivors_pairs = fluency_filter(client, fluency_pairs, logger, debug_writer,
                                      system=GA_FLUENCY_SYSTEM)
     survivor_lefts = {p["left"] for p in survivors_pairs}
-    n_t1_killed = n_before_t1 - len(survivors_pairs)
+    n_fluency_killed = n_before_fluency - len(survivors_pairs)
     dedup = [ind for ind in dedup if ind.s in survivor_lefts]
-    logger(f"  [GA] T1通顺筛: {n_before_t1} → {len(dedup)} (两边都通才留, 杀 {n_t1_killed})\n")
+    logger(f"  [GA] 通顺预筛: {n_before_fluency} → {len(dedup)} (两边都通才留, 杀 {n_fluency_killed})\n")
     if not dedup:
-        logger(f"  [GA] T1 后无候选, 仅持久化种群\n")
+        logger(f"  [GA] 预筛后无候选, 仅持久化种群\n")
         return GAEpochResult([], [], {}, "seed_ga",
                              [ind.to_dict() for ind in pop.to_list()],
                              {"offspring": len(offspring), "scored": 0, "gold": 0,
-                              "t1_killed": n_t1_killed})
+                              "fluency_killed": n_fluency_killed})
 
-    # 4. 全模型 score_pairs 直接打分 (fitness = 全模型均分, 废弃 surrogate)
+    # 4. 全模型 score_pairs 直接打分 (fitness = 全模型均分)
     #    分批喂 (GA_SCORE_BATCH), 避免单批过大导致模型输出截断.
     result_all = ScoreResult([], [], {})
     for i in range(0, len(dedup), GA_SCORE_BATCH):
@@ -311,6 +310,6 @@ def evolve(client: openai.OpenAI,
         gen_model="seed_ga",
         pop=[ind.to_dict() for ind in pop.to_list()],
         stats={"offspring": len(offspring), "scored": len(result_all.findings),
-               "gold": n_gold, "evicted": n_evict, "t1_killed": n_t1_killed,
+               "gold": n_gold, "evicted": n_evict, "fluency_killed": n_fluency_killed,
                "diversity": round(pop.mean_diversity(), 2)},
     )

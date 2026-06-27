@@ -13,13 +13,13 @@
 判据 (经实测确立):
   1. 静态「判词」信号 (wordfreq 词级 zipf / jieba 整词) 对二字组合无判别力。
   2. 唯一可靠信号: 字级 zipf (字认不认得) + 静态词典收录 (真词锚)。
-  3. "是不是通顺词" 这个语用判断只能 LLM 做 (T1 fluency + T2 scoring)。
+  3. "是不是通顺词" 这个语用判断只能 LLM 做 (预筛 fluency + 评分 scoring)。
 
 所以本模块只做:
   - 字典正向: S 在词典, G=goose(S), G 字级可读预筛。
   - 字典逆向: T 在词典, src=ungoose(T), src 字级可读预筛。
   - 不动点: S 在词典 且 goose(S)==S。
-  不做 G/S 的「是否通顺词」判断 (交给 T1/T2 LLM)。
+  不做 G/S 的「是否通顺词」判断 (交给预筛/评分 LLM)。
 
 所有产出保证 goose(left)==right (build_inverse 保证 inv 里的源 goose(src)==target)。
 """
@@ -39,8 +39,7 @@ MIN_LEN = 2
 MAX_LEN = 4
 # 字级可读阈值: left/right 每个字 zipf>=此值才保留 (砍含生僻字的组合)。
 CHAR_ZIPF_THRESH = 2.0
-# 固定 seed shuffle 词表 (跨 run cursor 一致)。注意: 现在 shuffle 的是词表,
-# 不是 pair list (旧版预生成 pair list 再 shuffle, 慢且无意义)。
+# 固定 seed shuffle 词表 (跨 run cursor 一致, 保证 cursor 处的 pair 跨 run 可重现)。
 _SHUFFLE_SEED = 719260817
 
 
@@ -84,7 +83,7 @@ def _ungoose_valid(target: str, inv: dict[str, list[str]]) -> str | None:
 def _word_to_pairs_full(w: str, words: set, inv: dict) -> list[dict]:
     """一个词能形成的全部 pair (fwd + rev + fixed). 现场算, us 级.
 
-    对应旧版三路生成器对单个词的逻辑, 合并到一个函数:
+    三路 (对单个词 w):
       fwd:   S=w, G=goose(w), 若 G!=w 且 G 字级可读 → (w, G, 'fwd')
       rev:   T=w, src=ungoose(w), 若 src 存在且 !=w 且 src 字级可读 → (src, w, 'rev')
       fixed: 若 goose(w)==w → (w, w, 'fixed')
@@ -188,44 +187,6 @@ class _LazyPairs:
             for p in self._w2p(w, self._words_set, self._inv):
                 yield p
 
-
-# ---------------------------------------------------------------------------
-# 旧三路生成器 (保留: 单测/诊断用; enumerate_pairs 改走 _LazyPairs)
-# ---------------------------------------------------------------------------
-
-def enumerate_forward(words) -> Iterator[tuple[str, str, str]]:
-    """正向: S 在词典 (真词锚), G=goose(S), G 字级可读 -> yield (S, G, 'fwd')."""
-    for S in words:
-        if not _valid_pair_word(S):
-            continue
-        G = goose(S)
-        if G == S:
-            continue  # 跳过全不动点 (fixed 类由 enumerate_fixed 单独处理)
-        if _chars_readable(G):
-            yield S, G, "fwd"
-
-
-def enumerate_reverse(words, inv: dict[str, list[str]]) -> Iterator[tuple[str, str, str]]:
-    """逆向: T 在词典 (真词锚), src=ungoose(T), src 字级可读 -> yield (src, T, 'rev')."""
-    for T in words:
-        if not _valid_pair_word(T):
-            continue
-        src = _ungoose_valid(T, inv)
-        if src is None or src == T:
-            continue
-        if _chars_readable(src):
-            yield src, T, "rev"
-
-
-def enumerate_fixed(words) -> Iterator[tuple[str, str, str]]:
-    """不动点: S 在词典 且 goose(S)==S -> yield (S, S, 'fixed')."""
-    for S in words:
-        if not _valid_pair_word(S):
-            continue
-        if goose(S) == S:
-            yield S, S, "fixed"
-
-
 # ---------------------------------------------------------------------------
 # 对外入口 (返回 _LazyPairs, 瞬间; pair 现场算)
 # ---------------------------------------------------------------------------
@@ -243,7 +204,7 @@ def enumerate_pairs() -> _LazyPairs:
 def enumerate_both_in_dict() -> _LazyPairs:
     """双边词典 pair (S∈词典 且 goose(S)∈词典), 返回惰性序列 _LazyPairs。
 
-    零噪声高精度子集, 两边都在词典 = 通顺强保证, 跳 T1 直接 T2。
+    零噪声高精度子集, 两边都在词典 = 通顺强保证, 跳过预筛直接评分。
     瞬间返回, pair 现场算。
     """
     return _LazyPairs(_shuffled_words(), _word_to_pairs_bidict)

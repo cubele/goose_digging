@@ -14,7 +14,7 @@
   7. wordfreq top_n_list('zh', N) — subtitles/wikipedia 频率统计
 
 合并去重后规模以 dictionary_stats() 实际输出为准 (docstring 不写死数字防漂移).
-盲区词 (赶班/撬松 这类真实通顺但词典没收的) 由 T1 (fluency.py) 的 LLM 通顺判定覆盖.
+盲区词 (赶班/撬松 这类真实通顺但词典没收的) 由通顺预筛 (fluency.py) 的 LLM 判定覆盖.
 """
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ def load_static_dictionary() -> frozenset[str]:
 
 
 def load_dictionary() -> set[str]:
-    """枚举锚集 = 静态词典. (盲区词由 T1 LLM 通顺判定覆盖, 不再扩充.)"""
+    """枚举锚集 = 静态词典. (盲区词由预筛 LLM 通顺判定覆盖, 不再扩充.)"""
     return set(load_static_dictionary())
 
 

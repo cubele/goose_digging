@@ -29,7 +29,7 @@ class MiningState:
     seen_pairs: set[tuple[str, str]] = field(default_factory=set)
     gold_pairs: list[Finding] = field(default_factory=list)
     n_iter: int = 0
-    phase: str = "bidict"  # bidict(双边词典纯T2) | full(全量+T1) | seed(种子发掘) | done
+    phase: str = "bidict"  # bidict(双边词典纯评分) | full(全量+预筛) | seed(种子发掘) | done
     cursor_bidict: int = 0
     cursor_full: int = 0
     # GA 神鹅语进化状态 (seed 阶段用, mining/ga)
@@ -68,15 +68,13 @@ class MiningState:
             return cls()
         data = json.loads(path.read_text(encoding="utf-8"))
         st = cls()
-        st.seen_pairs = {(a, b) for pair in data.get("seen_pairs", [])
-                         for a, b in [pair]}  # 容忍破损: 非2元组跳过
-        st.gold_pairs = [Finding.from_dict(d) for d in data.get("gold_pairs", [])]
-        st.n_iter = data.get("n_iter", 0)
-        st.cursor_bidict = data.get("cursor_bidict", 0)
-        st.cursor_full = data.get("cursor_full", 0)
-        st.phase = data.get("phase", "bidict")
-        # GA 字段: 旧 state.json 没有这两项, data.get 默认空 (容忍旧盘续跑)
-        st.ga_population = data.get("ga_population", []) or []
-        st.ga_epoch = data.get("ga_epoch", 0)
-        st.ga_seen_s = data.get("ga_seen_s", []) or []
+        st.seen_pairs = {(a, b) for a, b in data["seen_pairs"]}
+        st.gold_pairs = [Finding.from_dict(d) for d in data["gold_pairs"]]
+        st.n_iter = data["n_iter"]
+        st.cursor_bidict = data["cursor_bidict"]
+        st.cursor_full = data["cursor_full"]
+        st.phase = data["phase"]
+        st.ga_population = data["ga_population"]
+        st.ga_epoch = data["ga_epoch"]
+        st.ga_seen_s = data["ga_seen_s"]
         return st

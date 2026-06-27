@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """神鹅语遗传算法 (GA) 子包.
 
-稳态 GA + 小生境多样性, 仅用 LLM 打分 (不造句).
+稳态 GA + 小生境多样性, 直接用全模型 LLM 打分 (不造句).
 
-单层全模型打分 (废弃旧 surrogate 两层架构: 早期用单模型 Flash surrogate 驱动进化,
-导致 GA 朝该单模型偏好收敛, 现改为全模型 score_pairs 直接打分, fitness=均分).
+适应度 = 全模型 score_pairs 的 k 模型 cross-check 均分.
 
 模块:
   genome     基因型 (候选中文串 S) + 算子 (crossover/mutation/immigrant)

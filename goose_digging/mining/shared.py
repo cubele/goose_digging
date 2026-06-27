@@ -8,7 +8,7 @@ from .jsonx import parse_json_list
 def parse_scores(raw: str) -> dict[str, dict]:
     """细评解析: 返回 {left: {score, why}}."""
     out: dict[str, dict] = {}
-    for item in parse_json_list(raw, label="T2-score"):
+    for item in parse_json_list(raw, label="评分"):
         if not isinstance(item, dict):
             continue
         left = str(item.get("left", "")).strip()

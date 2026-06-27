@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """实时双写 Logger: 同时写 stdout 和 log file, 每行立即 flush, 供 tail -f.
 
-T1/T2 的正文 + 进度心跳经这里落 run_*.log.
-T2 多模型评分的思维链不走本 Logger, 而是各写各的 mined/model_<ts>_<model>.log
+预筛/评分的正文 + 进度心跳经这里落 run_*.log.
+评分多模型的思维链不走本 Logger, 而是各写各的 mined/model_<ts>_<model>.log
 (见 llm.ModelLogger), 避免多模型并行时互相覆盖/淹没主日志.
 """
 from __future__ import annotations

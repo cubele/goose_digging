@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""T2 关系评分: k 模型并行 cross-check.
+"""关系评分: k 模型并行 cross-check.
 
 每个 SCORE_MODELS 里的模型并行打分 (ThreadPoolExecutor), 取均分为最终 score.
 任一模型打分>=SCORE_THRESH 的 pair 另存 gold.jsonl 供人工看 (不只看均分, 任一模型见的 gold 都留).
@@ -59,7 +59,7 @@ def score_pairs(client: openai.OpenAI, pairs: list[dict], rnd: int,
                 prompt_fn=score_prompt,
                 thresh: float = SCORE_THRESH,
                 ) -> tuple[list[Finding], list[dict], dict]:
-    """T2: k 模型 cross-check 并行. 返回 (findings, gold_hits, per_pair_scores).
+    """k 模型 cross-check 并行. 返回 (findings, gold_hits, per_pair_scores).
 
     取均分为最终 score. 任一模型打分>=thresh 的 pair 进 gold_hits (落 gold.jsonl).
     per_pair_scores: {left: {scores:[...], whys:[...]}} 顺序同 models 的平行列表,
@@ -98,7 +98,7 @@ def score_pairs(client: openai.OpenAI, pairs: list[dict], rnd: int,
             mname = mc["model"]
             model_t0[i] = time.time()
             fut = pool.submit(_score_one_model, client, mc, pairs, rnd,
-                              f"T2-{mname} r{rnd}",
+                              f"评分-{mname} r{rnd}",
                               model_loggers[mname], debug_writer,
                               system, prompt_fn)
             futures[fut] = i
@@ -131,14 +131,14 @@ def score_pairs(client: openai.OpenAI, pairs: list[dict], rnd: int,
     # 由下面条数校验显式标出来 —— 否则空返回会被静默吞掉, 既不报错也不报漏.
     valid_models = [(i, all_scores[i]) for i in range(n_models) if not model_errors[i]]
     if not valid_models:
-        logger("\n  [T2] ⚠️ 所有模型都失败, 跳过本批\n")
+        logger("\n  [评分] ⚠️ 所有模型都失败, 跳过本批\n")
         return [], [], {}
     ok_names = ", ".join(models[i]["model"] for i, _ in valid_models)
     err_info = ""
     failed = [f"{models[i]['model']}:{model_errors[i]}" for i in range(n_models) if model_errors[i]]
     if failed:
         err_info = f" (失败: {'; '.join(failed)})"
-    logger(f"\n  [T2] {len(valid_models)}/{n_models}模型完成: {ok_names}{err_info}\n")
+    logger(f"\n  [评分] {len(valid_models)}/{n_models}模型完成: {ok_names}{err_info}\n")
 
     # 校验每个模型回的条数: 正常应等于输入 len(pairs). 少回 = 模型漏项 / 输出被截断.
     # 漏的 pair 会被均值跳过 (静默丢数据), 这里显式标出来让人知道.
@@ -151,12 +151,12 @@ def score_pairs(client: openai.OpenAI, pairs: list[dict], rnd: int,
         if n_got < expected:
             mname = models[i]["model"]
             if n_got == 0:
-                logger(f"  [T2] ⚠️ {mname} 一条都没回 ({len(sc)}项) —— 输出可能被截断/格式错, "
+                logger(f"  [评分] ⚠️ {mname} 一条都没回 ({len(sc)}项) —— 输出可能被截断/格式错, "
                        f"该模型对本批无贡献\n")
             else:
                 sample = ",".join(list(missing)[:5])
                 more = f" 等{len(missing)}条" if len(missing) > 5 else ""
-                logger(f"  [T2] ⚠️ {mname} 只回了 {n_got}/{expected} 条 "
+                logger(f"  [评分] ⚠️ {mname} 只回了 {n_got}/{expected} 条 "
                        f"(漏: {sample}{more})\n")
 
     findings = []
@@ -228,9 +228,9 @@ def _report_progress(logger: Callable[[str], None],
             parts.append(f"⏳{mname}({now-model_t0[i]:.0f}s,{kb:.0f}B)")
     in_flight = len(models) - n_done
     if final:
-        logger(f"  [T2] 全部完成: {n_done}/{len(models)} "
+        logger(f"  [评分] 全部完成: {n_done}/{len(models)} "
                f"({'失败 '+str(n_fail) if n_fail else 'ok'})  {' | '.join(parts)}\n")
     else:
         # 用 [..] 把 ⏳ 的部分突出来, 让主 term 看到还在等的模型
-        logger(f"  [T2] 进度 {n_done}/{len(models)} "
+        logger(f"  [评分] 进度 {n_done}/{len(models)} "
                f"(等{in_flight})  {' | '.join(parts)}\n")

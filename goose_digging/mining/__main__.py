@@ -3,13 +3,13 @@
 
 用法:
   python -m goose_digging.mining            # 默认: 按顺序跑 bidict→full→seed
-  python -m goose_digging.mining bidict     # 只跑双边词典阶段 (跳过T1, 纯T2)
-  python -m goose_digging.mining full       # 只跑全量枚举阶段 (T1+T2)
+  python -m goose_digging.mining bidict     # 只跑双边词典阶段 (跳过预筛, 纯评分)
+  python -m goose_digging.mining full       # 只跑全量枚举阶段 (预筛+评分)
   python -m goose_digging.mining seed       # 只跑 GA 神鹅语进化 (需先有 scored.jsonl 种子)
 
 阶段说明 (固定顺序, state.phase 记录当前进度, 跨 run 续):
-  bidict  双边词典 (S∈词典 且 goose(S)∈词典), 零噪声, 跳过T1直接T2. 优先挖, 产 scored 种子.
-  full    全量枚举 (单边词典), T1通顺筛后T2. 覆盖赶班/撬松这类右边不在词典的, 继续产 scored 种子.
+  bidict  双边词典 (S∈词典 且 goose(S)∈词典), 零噪声, 跳过预筛直接评分. 优先挖, 产 scored 种子.
+  full    全量枚举 (单边词典), 通顺预筛后评分. 覆盖赶班/撬松这类右边不在词典的, 继续产 scored 种子.
   seed    GA 神鹅语进化: scored.jsonl 高分 pair→字/词映射积木→稳态 GA 进化(全模型打分)→gold.
           从零开始: 先跑 bidict/full 产种子, 再 seed. scored.jsonl 空时 seed 会跳过.
 
@@ -17,7 +17,7 @@ LLM 配置: 复制 llm_config.toml.example → llm_config.toml 填自己的 base
           没配置则用 config.py 占位默认.
 
 日志布局 (多模型并行打分):
-  mined/logs/run_<ts>.log            主 term 全量日志 (启动信息 + T1/T2 进度心跳 + 结果).
+  mined/logs/run_<ts>.log            主 term 全量日志 (启动信息 + 预筛/评分进度心跳 + 结果).
                                 不再含任何模型思维链 —— 只起监视作用.
   mined/logs/model_<ts>_<model>.log  每个评分模型独占的思维链日志 (跨 round 追加).
                                 tail -f 单个文件即可实时盯某模型的推理.
@@ -44,7 +44,7 @@ PHASES = ["bidict", "full", "seed"]
 
 
 def _run_bidict(client, state, log, dw, all_findings, model_loggers):
-    """双边词典阶段: 跳过T1直接T2. 跑到 cursor 耗尽."""
+    """双边词典阶段: 跳过预筛直接评分. 跑到 cursor 耗尽."""
     log.log(f"# 双边词典候选中...")
     all_pairs = enum_mod.enumerate_both_in_dict()
     log.log(f"# {len(all_pairs)} 双边词典候选  cur={state.cursor_bidict}")
@@ -57,8 +57,8 @@ def _run_bidict(client, state, log, dw, all_findings, model_loggers):
 
 
 def _run_full(client, state, log, dw, all_findings, model_loggers):
-    """全量枚举阶段: T1+T2. 跑到 cursor 耗尽."""
-    log.log(f"# 全量枚举候选中 (需T1)...")
+    """全量枚举阶段: 预筛+评分. 跑到 cursor 耗尽."""
+    log.log(f"# 全量枚举候选中 (需预筛)...")
     all_pairs = enum_mod.enumerate_pairs()
     log.log(f"# {len(all_pairs)} 全量候选  cur={state.cursor_full}")
     while state.cursor_full < len(all_pairs):

@@ -52,12 +52,11 @@ def _sharing(d: float, sigma: float) -> float:
 def shared_fitness(ind: Individual, pop: list[Individual], sigma: float) -> float:
     """fitness sharing: raw / (1 + Σ sh(d)).
 
-    raw = 该个体当前最佳已知分 (全模型均分; 旧 state.json 续跑的个体可能只有 surrogate).
+    raw = 该个体全模型均分 (ind.raw_score).
     分母把附近相似个体的密度计入 → 聚集的相似个体分数被稀释.
     自己到自己是 d=0, sh=1, 故分母至少含 1 (1+1=2 自稀释一半, 避免除零且鼓励独特点).
     """
-    raw = ind.scores if ind.scores else ([ind.surrogate] if ind.surrogate is not None else [0.0])
-    raw_score = sum(raw) / len(raw) if raw else 0.0
+    raw_score = ind.raw_score()
     niche = 0.0
     for other in pop:
         d = levenshtein(ind.s, other.s)
@@ -85,7 +84,7 @@ class Population:
 
     @staticmethod
     def _dedupe(inds: list[Individual]) -> list[Individual]:
-        """按 s 去重, 同 s 取最高分 (全模型均分; 旧盘可能只有 surrogate)."""
+        """按 s 去重, 同 s 取最高分 (raw_score)."""
         best: dict[str, Individual] = {}
         for ind in inds:
             cur = best.get(ind.s)

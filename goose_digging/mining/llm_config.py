@@ -5,7 +5,6 @@
 各阶段模型即可, 不动代码. 没有配置文件时走 config.py 占位默认 (用户需自行改对).
 
 配置优先级 (api_key): TOML [security] api_key > 环境变量 GOOSE_API_KEY.
-(明文 API_KEY 文件回退已移除: 易误提交泄露密钥, 不再支持.)
 
 TOML 解析: 自写微型解析器 (纯标准库, 支持 3.8+), 不引入 tomli/toml 依赖.
 只支持本项目用的结构: 顶层/表内的 key="str"/bool/int, 以及 [[array]] 重复表.

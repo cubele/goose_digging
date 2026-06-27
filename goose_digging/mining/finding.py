@@ -20,7 +20,7 @@ class Finding:
     """一条挖掘结果. S -> real_goose_S 即 goose(S)=real_goose_S (已程序校验)."""
     S: str                       # pair 左边 (展示用)
     real_goose_S: str            # 程序用 goose() 算的真实值 (右边)
-    why: str                     # T2 评分时的一句话关系说明
+    why: str                     # 评分时的一句话关系说明
     round: int
     score: float = 0.0
     direction: str = ""          # fwd=(S,goose(S)) / rev=(ungoose(S),S) / fixed / seed

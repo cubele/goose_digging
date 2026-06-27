@@ -10,13 +10,10 @@
   length         字数
   scores         全模型分列表 (fitness = 均分; 未评时 None)
   born           出生 epoch 号
-  surrogate      DEPRECATED. 旧版单模型适应度 (已废弃改全模型直接打分).
-                 仅保留字段以兼容旧 state.json 续跑 (from_dict 读旧盘不崩);
-                 生产代码不再写入. raw_score() 仅在 scores 缺失时回退用它.
 
 算子全部从现有"积木"构造 (不引入新数据源):
   crossover      段拼接: 父A前缀 + 父B后缀, 裁剪到 [MIN_LEN, MAX_LEN]
-  mutation       按概率选一: 字映射替换 / 词积木插值 / 删字 / 重复字
+  mutation       按概率选一: 字映射替换 / 词积木插值 / 删字
   immigrant      近均匀采样从零拼一条全新 S (探索源, 对应用户说的"随机字映射采样"基因)
 
 所有算子接受外部传入的 rng (random.Random), 保证跨 epoch 可复现/断点续一致.
@@ -36,33 +33,28 @@ class Individual:
     s: str
     scores: list[int] | None = None   # 全模型分 (fitness=均分; 未评时 None)
     born: int = 0                     # 出生 epoch
-    surrogate: float | None = None    # DEPRECATED 旧单模型分 (仅兼容旧 state.json 读盘)
 
     @property
     def length(self) -> int:
         return len(self.s)
 
     def to_dict(self) -> dict:
-        """序列化 (落 state.json 断点续). surrogate 已废弃, 不再写入."""
+        """序列化 (落 state.json 断点续)."""
         return {"s": self.s, "scores": self.scores, "born": self.born}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Individual":
-        # 兼容旧 state.json: 旧盘可能含 surrogate 字段, 读进来不崩 (字段保留但不再使用).
         return cls(s=str(d.get("s", "")),
                    scores=d.get("scores"),
-                   born=int(d.get("born", 0)),
-                   surrogate=d.get("surrogate"))
+                   born=int(d.get("born", 0)))
 
     def raw_score(self) -> float:
-        """当前最佳已知分: 优先全模型均分; scores 缺失时回退 surrogate (兼容旧盘); 都没有返 0.
+        """当前最佳已知分 (全模型均分; 未评返 0).
 
         供排序/锦标赛/替换比较用 (不掺多样性调整, 那是 shared_fitness 的事).
         """
         if self.scores:
             return sum(self.scores) / len(self.scores)
-        if self.surrogate is not None:
-            return self.surrogate   # 仅旧 state.json 续跑时可能命中
         return 0.0
 
 
@@ -71,11 +63,14 @@ class Individual:
 # ---------------------------------------------------------------------------
 
 def _clamp_len(s: str, min_len: int, max_len: int) -> str:
-    """裁剪到 [min_len, max_len]: 过长截断, 过短重复末字补足 (叠词也是合法神鹅语)."""
+    """裁剪到 [min_len, max_len]: 过长截断, 过短原样返回.
+
+    过短不再补足 (旧版曾重复末字凑 min_len, 但那只会制造叠词垃圾, 而 GA_FLUENCY_SYSTEM
+    正好杀叠词堆砌 —— 造了也是白造+浪费 T1 token). 过短的串交给调用方的 is_viable 预筛
+    自然丢弃即可.
+    """
     if len(s) > max_len:
         return s[:max_len]
-    while len(s) < min_len and s:
-        s += s[-1]   # 末字重复补足 (产生叠词, 呼应 gold_long 里高频叠词不动点)
     return s
 
 
@@ -109,7 +104,7 @@ def crossover(parent_a: str, parent_b: str, min_len: int, max_len: int,
 
 
 # ---------------------------------------------------------------------------
-# mutation: 字映射替换 / 词积木插值 / 删字 / 重复字
+# mutation: 字映射替换 / 词积木插值 / 删字
 # ---------------------------------------------------------------------------
 
 def mutate(s: str, char_sample: list[tuple[str, str]],
@@ -123,7 +118,7 @@ def mutate(s: str, char_sample: list[tuple[str, str]],
     if not s:
         return s
     mode = rng.random()
-    if mode < 0.40 and char_sample:
+    if mode < 0.50 and char_sample:
         # 1) 字映射替换: 把 S 里某字 a 换成"能映射到目标 b 的另一个源字",
         #    直接改变 goose(S) 该位输出. 用采样的 (a,b): 若 S 含 a, 替换成 b
         #    (b 是 goose(a), 但 b 本身也可能是某字的源, goose(b) 会变, 制造新变换).
@@ -134,7 +129,7 @@ def mutate(s: str, char_sample: list[tuple[str, str]],
             # S 不含 a: 把随机一位换成 b (注入新字)
             i = rng.randrange(len(s))
             s = s[:i] + b + s[i + 1:]
-    elif mode < 0.65 and word_sample:
+    elif mode < 0.80 and word_sample:
         # 2) 词积木插值: 从词映射取一块, 替换 S 中等长的一段
         w = rng.choice(word_sample)
         chunk = w[0]  # 词映射的 left (2字)
@@ -145,14 +140,17 @@ def mutate(s: str, char_sample: list[tuple[str, str]],
             # S 比块短: 插入到随机位
             i = rng.randint(0, len(s))
             s = s[:i] + chunk + s[i:]
-    elif mode < 0.83 and len(s) > min_len:
+    elif len(s) > min_len:
         # 3) 删字 (产生更紧凑的短句)
         i = rng.randrange(len(s))
         s = s[:i] + s[i + 1:]
     else:
-        # 4) 重复字 (产生叠词/不动点, 呼应 gold_long 高频的不动点神鹅语如 脱内裤→脱内裤)
-        i = rng.randrange(len(s))
-        s = s[:i] + s[i] + s[i:]
+        # 4) 兜底: 字映射替换 (上面各分支不满足条件时的归处, 如 S=min_len 无法删).
+        #    仍驱动变换, 不制造叠词. char_sample 为空时原样返回.
+        if char_sample:
+            a, b = rng.choice(char_sample)
+            i = rng.randrange(len(s))
+            s = s[:i] + b + s[i + 1:]
     return _clamp_len(s, min_len, max_len)
 
 

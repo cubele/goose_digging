@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-"""GA 适应度: 直接用全模型 score_pairs 打分 (单层, 废弃 surrogate).
+"""GA 适应度: 全模型 score_pairs 打分.
 
-设计变更 (基于实测诊断): 旧版用 Flash 单模型 surrogate 驱动进化, 导致 GA 朝 Flash
-偏好收敛 (promote→gold 转化率仅 40%, 进化方向被带偏). 现改为全模型直接打分:
-  fitness = score_pairs 4 模型 cross-check 的均分 —— 真正的神鹅语审美信号.
-代价是 LLM 成本回到 ~4x (代数减少), 但每代质量真实, 进化方向不被单模型污染.
+fitness = score_pairs 的 k 模型 cross-check 均分 (真·神鹅语审美信号).
+4 模型 (DeepSeek-V4 Flash/Pro, Qwen3.7-Max, GLM-5.1) 并行评分 + cross-check,
+保证不偏向任一模型审美. 代价是 LLM 成本 ~k×, 但每代质量真实.
 
 流程: 全模型 score_pairs 打分一批 offspring → 返回 ScoreResult:
   findings    全模型评分结果 (落 scored.jsonl 用), score=均分

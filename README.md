@@ -1,22 +1,20 @@
 # 神鹅语挖掘 (Goose Digging)
 
-自动挖掘"神鹅语"——一种因字符编码错乱(GBK/EUC-JP 误读)产生的、两边都通顺却形成反差的双关中文。
+自动挖掘"神鹅语":一句通顺的中文 `S`,经字符映射 `goose(S)` 后得到另一句也通顺、意思截然不同的中文。例:`粪厂 → 实境`。
 
-> **神鹅语**:一句通顺的中文 `S`,经过字符映射 `goose(S)` 后,恰好变成**另一句也通顺、但意思截然不同**的中文。妙处全在两边的反差与谐音。
->
-> 例子:`粪厂 → 实境`
-
-本项目用 **遗传算法 + 多模型 LLM 评分** 自动发现这样的句子,**LLM 只用于打分(通顺预筛 + 关系质量),不参与造句**——造句靠 GA 在"鹅语碎片 + 随机字映射"空间进化。
+方法为遗传算法造句 + 多模型 LLM 打分。LLM 只打分(通顺预筛 + 关系评分),不造句;造句由 GA 在"鹅语碎片 + 随机字映射"空间进化。
 
 ## 目录
 
 - [快速开始](#快速开始)
 - [配置 LLM](#配置-llm)
 - [算法](#算法)
-- [可调参数 (knob)](#可调参数-knob)
-- [改进方式](#改进方式)
-- [输出文件与数据格式](#输出文件与数据格式)
-- [辅助脚本](#辅助脚本)
+- [可调参数](#可调参数)
+- [自定义 Prompt](#自定义-prompt)
+- [调优指南](#调优指南)
+- [输出文件](#输出文件)
+- [脚本](#脚本)
+- [项目结构](#项目结构)
 
 ---
 
@@ -30,48 +28,44 @@ cd goose_digging
 pip install -e .
 ```
 
-依赖(见 `pyproject.toml`):`opencc-python-reimplemented`、`openai`、`wordfreq`。Python ≥ 3.8。
+依赖(`pyproject.toml`):`opencc-python-reimplemented`、`openai`、`wordfreq`。Python ≥ 3.8。
 
 ### 配置 LLM
-
-复制示例配置,填入你自己的 API:
 
 ```bash
 cp llm_config.toml.example llm_config.toml
 # 编辑 llm_config.toml: 填 base_url / api_key / 各阶段模型
 ```
 
-详细字段见 [配置 LLM](#配置-llm)。
-
-### 跑
+### 运行
 
 ```bash
-python -m goose_digging.mining            # 默认: 按顺序 bidict → full → seed
+python -m goose_digging.mining            # 默认: bidict → full → seed
 python -m goose_digging.mining bidict     # 只跑双边词典阶段
 python -m goose_digging.mining full       # 只跑全量枚举阶段
-python -m goose_digging.mining seed       # 只跑 GA 神鹅语进化 (需先有 scored 种子)
+python -m goose_digging.mining seed       # 只跑 GA 进化 (需先有 scored 种子)
 ```
 
-实时看进度:`tail -f mined/logs/run_*.log`
+看进度:`tail -f mined/logs/run_*.log`
 
 ---
 
 ## 配置 LLM
 
-所有 LLM 走 **OpenAI 兼容 Chat Completions API**(`base_url` + `api_key`)。支持 OpenAI 官方 / DeepSeek / 智谱 GLM / Together / 自部署 vLLM 等。
+所有 LLM 走 OpenAI 兼容 Chat Completions API(`base_url` + `api_key`)。支持 OpenAI / DeepSeek / 智谱 GLM / Together / 自部署 vLLM 等。
 
 `llm_config.toml`(复制自 `llm_config.toml.example`):
 
 ```toml
 [security]
 base_url = "https://llmapi.paratera.com/v1"   # OpenAI 兼容端点
-api_key  = "sk-..."                           # 你的 key (别提交这个文件!)
+api_key  = "sk-..."                           # 你的 key (别提交这个文件)
 
-[fluency]            # T1 通顺预筛: 便宜小模型, 关 thinking
+[fluency]            # 通顺预筛: 便宜小模型, 关 thinking
 model = "DeepSeek-V4-Flash"
 thinking = false
 
-[[score]]            # T2 关系评分: 多模型 cross-check, 取均分, 任一>=6 入 gold
+[[score]]            # 关系评分: 多模型 cross-check, 取均分, 任一>=6 入 gold
 model = "DeepSeek-V4-Flash"
 thinking = true
 
@@ -88,156 +82,148 @@ model = "GLM-5.1"
 thinking = false
 ```
 
-**优先级**:`llm_config.toml` 里的字段 > `config.py` 占位默认。没有 `llm_config.toml` 时走 `config.py` 的 OpenAI 占位(需自行改对)。
+优先级:`llm_config.toml` 字段 > `config.py` 占位默认。无配置文件时走 `config.py` 占位(需自行改对)。
 
-**api_key 优先级**:TOML `[security] api_key` > 环境变量 `GOOSE_API_KEY`。(明文 `API_KEY` 文件回退已移除:易误提交泄露密钥。)
+api_key 优先级:`[security] api_key` > 环境变量 `GOOSE_API_KEY`。
 
-各阶段模型建议:
-- **T1 通顺预筛**(`[fluency]`):便宜快的小模型,关 thinking。只判两边通不通,省 T2 的 token。
-- **T2 关系评分**(`[[score]]`,可列多个):强模型,开 thinking(关系判断是难任务)。**模型越多越准但越贵**——每个候选要被 k 个模型各打一次分。建议 2-4 个。
-
-默认配置(无 `llm_config.toml` 时)用的是 `https://llmapi.paratera.com/v1` 端点 + DeepSeek-V4-Flash/Pro + Qwen3.7-Max + GLM-5.1 这套,可按需改成自己的 OpenAI 兼容服务。
+各阶段模型:
+- **通顺预筛**(`[fluency]`):便宜快的小模型,关 thinking。只判两边通不通。
+- **关系评分**(`[[score]]`,可列多个):强模型,开 thinking。每个候选被 k 个模型各打一次分,k 越大越准也越贵。建议 2-4 个。
 
 ---
 
 ## 算法
 
-挖掘分三阶段(固定顺序,`state.json` 记进度,跨 run 续跑):
+挖掘分三阶段,固定顺序,`state.json` 记进度,跨 run 续跑:
 
 ```
             ┌─────────┐     ┌─────────┐     ┌──────────────────────┐
 scored.jsonl│         │     │         │     │                      │
    ↑        │ bidict  │────▶│  full   │────▶│   seed (GA 进化)      │──▶ state.gold_pairs
    │        │ 双边词典 │     │ 全量枚举 │     │  字/词映射积木 → 进化  │   (持久化 gold)
-   └────────┤ 跳过T1  │     │ T1+T2   │     │  → 全模型打分 → gold  │
+   └────────┤ 跳过预筛 │     │预筛+评分 │     │  → 全模型打分 → gold  │
    (种子源) └─────────┘     └─────────┘     └──────────────────────┘
 ```
 
 ### 阶段一、二:枚举 (bidict / full)
 
-两阶段都用**枚举驱动**:`all_pairs` 一次性枚举(固定 seed shuffle,跨 run 顺序一致),按 cursor 分批送 T1/T2,**state.json 记 cursor/seen_pairs,断电续跑**。
+两阶段用枚举驱动:一次性枚举所有候选(固定 seed shuffle,跨 run 顺序一致),按 cursor 分批送预筛/评分。
 
-- **bidict**:S 和 `goose(S)` 都在词典里的 pair。零噪声(两边都是真词)。**跳过 T1** —— 两边都在词典已天然满足 T1 的判据(a),字典短路零 LLM,直接进 T2。
-- **full**:单边枚举(S 在词典),`goose(S)` 可能不在词典。走 **T1 通顺预筛**(三选一判据)+ T2 评分。覆盖"右边不在词典但讲得通"的(如 赶班/撬松)。
+- **bidict**:`S` 与 `goose(S)` 都在词典里的 pair。两边都是真词,跳过预筛,直接进评分。
+- **full**:单边枚举(`S` 在词典),`goose(S)` 可能不在词典。走通顺预筛 + 评分。覆盖右边不在词典但讲得通的情况(赶班/撬松)。
 
-这两个阶段产出 `scored.jsonl`(**所有打分 pair 全量落盘,含低分**),作为下一阶段 GA 的**种子源**。
+两阶段产出 `scored.jsonl`(全量打分记录,含低分),作为 GA 的种子源。
 
-#### T1 通顺预筛 (三选一判据)
+#### 通顺预筛
 
-T1 = **两边都讲得通才打分**的预筛,砍明显乱码/字硬拼,省 T2 全模型 token。对每个 left/right,满足以下任一即判通顺:
+判 left/right 两边是否都讲得通,砍明显乱码,省评分 token。满足以下任一即判通顺:
 
-- **(a) 在词表里 / 真实词** → 字典短路,**零 LLM** (`fluency_filter` 词典命中直接 ok=true)
-- **(b) 解释得通的词语** —— 谐音/口语/俚语/略不规范但讲得通(如 赶班=赶去上班)
-- **(c) 可作为句子的一部分** —— 能塞进一句话说得通
+- (a) 在词表里 / 真实词 —— 词典命中直接判通顺,不调 LLM
+- (b) 解释得通的词语(谐音/口语/俚语,如 赶班=赶去上班)
+- (c) 可作为句子的一部分
 
-只杀"字硬拼/纯随机字组合/明显乱码"。词典外的串才送 Flash(关 thinking)判 (b)/(c)。**只有 left 和 right 都判通顺的 pair 才进 T2 打分**。GA 阶段用更宽的 `GA_FLUENCY_SYSTEM`(能解释得通产生联想即可,长句尤其宽松)。
+只杀字硬拼、纯随机字组合、明显乱码。词典外的串才送模型判 (b)/(c)。两边都通顺才进评分。GA 阶段用更宽的 `GA_FLUENCY_SYSTEM`(能产生联想即通顺,长句尤其宽松)。
 
-#### 枚举打包 & LLM 批大小控制
+#### 批大小
 
-| 阶段 | 机制 | 每批大小 |
+| 阶段 | 机制 | 每批 |
 |---|---|---|
-| **T1**(full) | 每轮预取 `T1_PARALLEL(5)` 个 `T1_FETCH(200)` 批,并行判通顺 | 5×200=1000 候选/轮 |
-| **T2**(枚举) | T1 存活攒满 `SCORE_BATCH(20)` 才进 T2 | 恰好 20 条/批 |
-| **GA T2** | offspring 分 `GA_SCORE_BATCH(10)` 一批喂全模型 | 恰好 10 条/批 |
+| 预筛 (full) | 每轮预取 `FLUENCY_PARALLEL(5)` 个 `FLUENCY_FETCH(200)` 批,并行判通顺 | 1000 候选/轮 |
+| 评分 (枚举) | 预筛存活攒满 `SCORE_BATCH(20)` 才进评分 | 20 条/批 |
+| 评分 (GA) | offspring 分 `GA_SCORE_BATCH(10)` 一批喂全模型 | 10 条/批 |
 
-- **full**:`while len(survivors) < SCORE_BATCH` 一直预取+判通顺,直到攒满 20 条存活才喂 T2 → T2 每批必然 20 条(除非候选耗尽)。
-- **bidict**:跳 T1,直接取 20 个未见的候选。
-- **T1 批大小硬编码**:`T1_FETCH=200` 控制喂 Flash 的批,`T1_PARALLEL=5` 路并行,合计每轮 1000 候选。Flash 漏回的重试(`FLUENCY_RETRY_MAX=2`),仍漏的才按不通处理(报警,不静默误杀)。
+bidict 跳过预筛,直接取 20 个未见的候选。预筛模型漏回的重试 `FLUENCY_RETRY_MAX(2)` 次,仍漏的按不通处理并报警。
 
-#### 断电续跑 (三重保护)
+#### 断点续跑
 
-1. **cursor 落盘**:`_next_batch` 前进 cursor 后,迭代末尾 `state.save()` **原子写** state.json(`.tmp`→`replace`)。重启从保存的 cursor 继续,不重判已前进的候选。bidict/full 各独立 cursor。
-2. **seen_pairs 兜底**:即使 cursor 落盘失败,`seen_pairs`(已评 pair 集合)也持久化,`_next_batch` 跳过已见 pair → **幂等,不重烧 LLM**。
-3. **GA 续跑**:`state.ga_population`(种群)+ `ga_epoch` + `ga_seen_s`(GA 评过的 S)全部持久化,重启后 `evolve` 用 `existing_population` 续种群,`ga_seen_s` 防重烧。
-4. **scored.jsonl 追加写**:每批 T2 打分后立即追加落盘(不覆盖),断电前的评分记录不丢。
+随时可中断,重启接着跑,不重烧 LLM:
 
-### 阶段三:GA 神鹅语进化 (seed)
+- **枚举**:`state.json` 记游标(bidict/full 各一个)+ 已评 pair 集合(`seen_pairs`),重启从断点继续,跳过已评。
+- **GA**:种群、epoch、已评的 S 全部持久化,重启续种群不重判。
+- **评分记录**:`scored.jsonl` 每批追加写,断电前的评分不丢。
 
-长句(3-9 字)组合空间爆炸,无法枚举。用**稳态遗传算法 + 小生境**在"鹅语碎片"空间进化,**LLM 只打分**。
+### 阶段三:GA 进化 (seed)
+
+长句(3-9 字)组合空间爆炸,无法枚举。用稳态遗传算法 + 小生境在"鹅语碎片"空间进化。
 
 **数据流**:
 ```
-scored.jsonl 已评 pair ──▶ 字映射 (goose(a)=b 的单字对, 按频次)
-                      ──▶ 词映射 (词级 pair, 按 score)
-                            │  近均匀 boost 采样 (高低分都采, 保证覆盖)
-                            ▼
+scored.jsonl ──▶ 字映射 (goose(a)=b 的单字对, 按频次)
+              ──▶ 词映射 (词级 pair, 按 score)
+                    │  近均匀采样 (高低分都采)
+                    ▼
             GA 进化 (mining/ga/evolve.py)
-                            │
-              ┌─────────────┼─────────────┐
-              ▼             ▼             ▼
-         crossover      mutation      immigrant
-         (段拼接)      (字映射替换    (近均匀采样
-          父A+父B       /词积木/删/重复) 全新拼)
-                            │
-                            ▼  预筛 (T1 两边都通) + 全模型 score_pairs 打分
-                            │
-                            ▼  fitness = 全模型 cross-check 均分
-                            │
-              ┌─────────────┴─────────────┐
-              ▼                           ▼
-       crowding 入种群               state.gold_pairs
-       + 防同化三件套                  (max>=6 持久化)
-       (aging/evict/seen)
+                    │
+          ┌─────────┼──────────┐
+          ▼         ▼          ▼
+     crossover  mutation   immigrant
+     (段拼接)  (字映射替换  (近均匀采样
+      父A+父B   /词积木/删/重复) 全新拼)
+                    │
+                    ▼  通顺预筛 (两边都通) + 全模型 score_pairs 打分
+                    ▼  fitness = 全模型均分
+                    │
+          ┌─────────┴──────────┐
+          ▼                    ▼
+     crowding 入种群      state.gold_pairs
+     + aging/evict/seen   (max>=6 持久化)
 ```
 
 **基因型**:一条候选中文串 S(3-9 字)。`goose(S)` 由 oracle 确定性算出。
 
-**算子**(全部从现有积木构造,不引入新数据源):
-- **crossover(段拼接)**:父 A 前缀 + 父 B 后缀,裁剪到合法长度。已有鹅语碎片的拼接。
-- **mutation**:字映射替换 / 词积木插值 / 删字 / 重复字(产生叠词)。直接驱动 `goose(S)` 变化。
-- **immigrant(随机移民)**:近均匀 boost 采样从零拼一条全新 S 注入种群。探索源,防早熟。
+**算子**:
+- **crossover(段拼接)**:父 A 前缀 + 父 B 后缀,裁剪到合法长度。
+- **mutation**:字映射替换 / 词积木插值 / 删字 (不造叠词 —— 旧版曾有重复字模式, 但 GA 的通顺预筛正好杀叠词堆砌, 造了也是白造)。
+- **immigrant(随机移民)**:近均匀采样从零拼一条全新 S 注入种群。
 
-**近均匀 boost 采样**(取代旧温度采样):权重 = `1 + signal*boost_alpha`(`SEED_BOOST_ALPHA=0.05`)。高分 9→1.45,低分 1→1.05,比值 ~1.4:1,**几乎一视同仁**。动机:低分词映射成句后可能反而出现高分长句(低分 pair 单看无巧,但塞进长句可能撞出神级反差),故需尽量完整覆盖,不能只采高分积木。`boost_alpha=0` 时退化为纯均匀随机。
+**近均匀采样**:权重 = `1 + signal*boost_alpha`。高分积木权重微高,低分的也采,因为低分 pair 塞进长句后可能撞出高分反差,只采高分会漏。`boost_alpha=0` 退化为纯均匀随机。
 
-**适应度(fitness)**= 全模型 `score_pairs` 的 k 模型 cross-check **均分**。这是真·神鹅语审美信号。
+**适应度**= 全模型 `score_pairs` 的 k 模型 cross-check 均分。
 
-> **为什么不用单模型 surrogate 省成本?** 早期版本用过单模型(Flash)驱动内层进化,实测单模型系统性高估"两边勉强通顺但无巧思"的候选,导致 GA 朝**该单模型的偏好**收敛(进化方向被带偏,promote→gold 转化率仅 40%)。改为全模型直接打分后,fitness 真实可靠。代价是 LLM 成本 ~k×,代数减少,但每代质量真实。
+**防同化**(防止种群坍缩到一类套路):
+- **aging**:年龄超 `GA_MAX_AGE` epoch 强制淘汰。
+- **evict gold**:max≥6 的个体存 gold 后移出种群。
+- **全局 seen_s**:评过的 S 记入 `state.ga_seen_s`,不重判。
 
-**T1 通顺预筛**:全模型打分前,先用便宜小模型(关 thinking)判候选**两边是否都讲得通**(三选一判据见上)。两边都不通的(如 哪哪墩墩、墙松垮你活活)直接杀掉,不浪费全模型 token。GA 阶段用更宽判据(`GA_FLUENCY_SYSTEM`,能解释得通产生联想即可,长句尤其宽松)——因为 GA 候选本就是谐音/联想串,严格判会误杀(吊挺吗=屌挺嘛)。
+**多样性**:fitness sharing(Levenshtein 邻域稀释聚集套路分)+ crowding 替换(新生填相似生态位)+ 随机移民 + 早熟震荡(diversity<2 时抬移民率)。
 
-**防同化三件套**(防止种群坍缩到一类套路):
-- **aging**:个体年龄超 `GA_MAX_AGE` epoch 强制淘汰(即使满分),防高分个体永久存活主导种群。
-- **evict gold**:全模型 max≥6 的个体(已存 gold)从种群移除——既存档就不该再占种群当进化锚点。
-- **全局 seen_s**:评过的 S 记入 `state.ga_seen_s`,永不重烧 LLM。
+### 评分标尺
 
-**多样性机制**:fitness sharing(Levenshtein 邻域稀释聚集套路分)+ crowding 替换(新生填相似生态位而非总替最差)+ 40% 随机移民 + 早熟震荡(diversity<2 时抬移民率)。**GA 参数已调宽**(种群 60/移民 0.40/精英 1/aging 4/sharing 2.5),配合近均匀采样最大化搜索空间覆盖,长时间运行持久探索广泛的神长句。
+评分阶段全模型对每个 pair 打 0-10 分,`max(各模型分) >= SCORE_THRESH(6)` 入 gold:
 
-### 评分标准
-
-T2 全模型对每个 pair 打 0-10 分,`max(各模型分) >= SCORE_THRESH(6)` 入 gold:
-- **9-10** 拍案叫绝,两边反差强烈且都自然
-- **6-8** 明显的双关/反讽/荒诞
-- **3-5** 有点意思但牵强
-- **0-2** 强行编故事或毫无关联
+- 9-10:两边反差强烈且都自然
+- 6-8:明显的双关/反讽/荒诞
+- 3-5:有点意思但牵强
+- 0-2:强行编故事或毫无关联
 
 ---
 
-## 可调参数 (knob)
+## 可调参数
 
-全部在 `goose_digging/mining/config.py`,hardcode 改这。LLM 模型走 `llm_config.toml`。
+全部在 `goose_digging/mining/config.py`,改代码。模型走 `llm_config.toml`。
 
 ### 挖掘核心
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `SCORE_THRESH` | 6 | 入 gold 阈值:max(各模型分)≥此值入 state.gold_pairs |
-| `SCORE_BATCH` | 20 | T2 单批喂多少 pair(过大易被服务端 length 截断) |
-| `SEED_MIN_SCORE` | 4.5 | GA 从 scored.jsonl 选 score≥此值的 pair 提取字/词映射积木 |
+| `SCORE_THRESH` | 6 | 入 gold 阈值:max(各模型分)≥此值入 gold_pairs |
+| `SCORE_BATCH` | 20 | 评分单批 pair 数(过大易被服务端 length 截断) |
+| _(无分数门槛)_ | — | GA 积木池=全部枚举 pair (不卡分数); 高低分权重由 `SEED_BOOST_ALPHA` 近均匀采样区分, 低分 pair 成句后可能反而高分 |
 
 ### GA 进化
 
-| 参数 | 默认 | 调大效果 | 调小效果 |
+| 参数 | 默认 | 调大 | 调小 |
 |---|---|---|---|
 | `GA_POP_SIZE` | 60 | 种群大,探索广 | 省内存/算力 |
 | `GA_OFFSPRING_PER_EPOCH` | 20 | 每 epoch 多产候选 | 省 LLM(每候选 k× 成本) |
-| `GA_IMMIGRANT_RATE` | 0.40 | 更多随机移民=更探索 | 更收敛(靠 crossover/mutation) |
+| `GA_IMMIGRANT_RATE` | 0.40 | 更探索 | 更收敛 |
 | `GA_CROSSOVER_RATE` | 0.50 | 更多碎片拼接 | — |
 | `GA_MUTATION_RATE` | 0.20 | 更多变异 | — |
-| `GA_TOURNAMENT_K` | 3 | 偏开发(选更强父) | 偏探索(更随机) |
-| `GA_ELITE` | 1 | 保留更多精英(收敛快) | 防种群坍缩 |
-| `GA_SHARING_SIGMA` | 2.5 | 更大邻域=多样性惩罚适度放宽 | 加强多样性约束 |
-| `GA_SCORE_BATCH` | 10 | 全模型单批喂更多 | 单批不易截断 |
-| `GA_MAX_AGE` | 4 | 好个体多留几代进化 | 更激进防同化 |
+| `GA_TOURNAMENT_K` | 3 | 偏开发(选更强父) | 偏探索 |
+| `GA_ELITE` | 1 | 收敛快 | 防种群坍缩 |
+| `GA_SHARING_SIGMA` | 2.5 | 多样性惩罚放宽 | 加强多样性约束 |
+| `GA_SCORE_BATCH` | 10 | 单批喂更多 | 不易截断 |
+| `GA_MAX_AGE` | 4 | 好个体多留几代 | 更激进防同化 |
 | `SEED_BOOST_ALPHA` | 0.05 | 高分积木权重更高 | 趋近纯均匀采样(0=纯随机) |
 | `GA_IMMIGRANT_BOOST_ALPHA` | 0.05 | 移民采高分积木更多 | 移民采样更均匀 |
 
@@ -245,104 +231,165 @@ T2 全模型对每个 pair 打 0-10 分,`max(各模型分) >= SCORE_THRESH(6)` �
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `GA_MAX_AGE` | 4 | 个体年龄上限(epoch)。超龄淘汰,防高分永久主导 |
-| `GA_EVICT_PROMOTED` | True | gold 个体(max≥thresh)存档后移出种群 |
-| `GA_EVICT_SCORE_THRESH` | 6.0 | 配合 evict:max(scores)≥此值视为"已挖到" |
+| `GA_EVICT_PROMOTED` | True | gold 个体存档后移出种群 |
+| `GA_EVICT_SCORE_THRESH` | 6.0 | max(scores)≥此值视为"已挖到",移出种群 |
 
 ---
 
-## 改进方式
+## 自定义 Prompt
 
-常见调优目标 → 改哪个参数:
+所有 prompt 在 `goose_digging/mining/prompts.py`。模型走 `llm_config.toml`,prompt 走代码。参数只能调"挖多少/多激进",prompt 决定"什么叫神、什么叫废",是微调语料风格的主要手段。
+
+### 6 个 prompt
+
+LLM 只在两处被调用:通顺预筛(便宜模型,砍乱码)和关系评分(全模型 cross-check)。每处分枚举阶段和 GA 阶段两条路径,共 4 条 system prompt,加 2 个 user prompt 构造函数。
+
+| prompt | 用在哪 | 喂给 | 作用 |
+|---|---|---|---|
+| `FLUENCY_SYSTEM` | 预筛 枚举阶段 | `FLUENCY_MODEL` | 判短语讲不讲得通,三选一即通顺,只杀乱码 |
+| `GA_FLUENCY_SYSTEM` | 预筛 GA 阶段 | `FLUENCY_MODEL` | 同上但更宽松,长句不误杀 |
+| `SCORE_SYSTEM` | 评分 枚举阶段 | `SCORE_MODELS` | 定 pair 神不神,0-10 分,带反幻觉例 |
+| `SEED_SCORE_SYSTEM` | 评分 GA 阶段 | `SCORE_MODELS` | 同上但通顺权重更高,防造句被双关带跑 |
+| `fluency_prompt()` | 预筛 user(枚举+GA) | — | 拼待判短语,要回 `{"items":[...]}` |
+| `score_prompt()` | 评分 user(枚举+GA) | — | 拼待评 pair,要回 `{"scores":[...]}` |
+
+调用链:
+- 枚举 full:`fluency_filter`(`FLUENCY_SYSTEM`)→ `score_pairs`(`SCORE_SYSTEM`)
+- 枚举 bidict:跳过预筛 → `score_pairs`(`SCORE_SYSTEM`)
+- GA:`fluency_filter`(`GA_FLUENCY_SYSTEM`)→ `score_offspring` → `score_pairs`(`SEED_SCORE_SYSTEM`)
+
+### 各 prompt 说明
+
+**通顺预筛**:任务是砍明显乱码,判据故意很宽(三选一即通顺),因为神鹅语的金子常在"单看不是标准词、但放进句子能读通"的边角(赶班、撬松)。"神不神"的判断完全交给评分,预筛只杀字硬拼。`GA_FLUENCY_SYSTEM` 比枚举版更宽,因为 GA 候选是字映射/词积木拼出的谐音联想串,严格判会误杀(吊挺吗=屌挺嘛)。
+
+**关系评分**:全模型 cross-check 取均分,任一 ≥6 入 gold。`SCORE_SYSTEM` 核心是"读者能不能一眼品到",强调多种读法(整句/谐音/荤段/拆字)、常用度门槛、一眼品到门槛,及反幻觉自检(防给不相关两词脑补反差)。`SEED_SCORE_SYSTEM` 把通顺一票否决提到最前(每个字都认识 ≠ 通顺,如 奶奶瞪鸡冲奶位),防造句被双关带跑给高分。
+
+### 改 prompt 的约束
+
+1. **JSON 契约不能破**。user prompt 要求模型回:
+   - `fluency_prompt` → `{"items": [{"text": "原词", "ok": true/false}]}`
+   - `score_prompt` → `{"scores": [{"left": "原左", "score": 0-10, "why": "..."}]}`
+
+   解析端(`jsonx.parse_json_list` + `shared.parse_scores`)取最外层数组,按 key 名 `text`/`ok`/`left`/`score`/`why` 取值。改文案可以,别改结构和字段语义:`score` 必须 0-10,`left`/`text`+`ok` 做一一对应(缺了这条候选就丢)。`why` 可删。
+
+2. **正反例别删**。`SCORE_SYSTEM` 里 `软件→起凤=1`(防脑补)、`奶奶瞪鸡冲奶位→≤2`(防字硬拼)等反例是模型不跑偏的主要约束。改文案时保留。
+
+3. **批量数量必须对齐**。两个 user prompt 都要求"必须全部回,N 条一一对应"。防模型漏回(输出截断会少条)。解析端有校验/重试(预筛)/报警(评分),但 prompt 这层要先卡住。
+
+### 验证
+
+```bash
+pytest goose_digging/tests/                # mock LLM, 确认没改崩契约 (80 测)
+python scripts/verify_full_e2e_mock.py     # mock 端到端, 三阶段串接 + GA
+# 真实 API 跑一小批看效果:
+python -m goose_digging.mining full
+python -m goose_digging.mining seed
+```
+
+改 prompt 后看 `mined/logs/model_<ts>_<model>.log` 的思维链判断文案有没有起效;低分候选看 `scored.jsonl` 的 `whys`。
+
+---
+
+## 调优指南
+
+目标 → 改哪里(参数去 `config.py`,prompt 去 `prompts.py`)。
+
+**调语料风格(太荤/太正经/不够妙)**:
+- 改 `SCORE_SYSTEM` / `SEED_SCORE_SYSTEM` 的标尺和正反例。这是调风格的主要手段。
 
 **想挖得更快(省 LLM)**:
 - 降 `GA_OFFSPRING_PER_EPOCH`(如 12-15)
-- 降 `llm_config.toml` 的 `[[score]]` 模型数(k=2 就够)
-- 增大 `GA_SCORE_BATCH`(如 15-20),减少全模型调用批次数
+- 降 `llm_config.toml` 的 `[[score]]` 模型数(k=2 够)
+- 增大 `GA_SCORE_BATCH`(如 15-20)
 
-**想要更多元(覆盖更广的神鹅语)**:
+**想覆盖更广**:
 - 调大 `GA_IMMIGRANT_RATE`(如 0.5)
-- 调大 `GA_SHARING_SIGMA`(如 3.0,邻域更宽,相似套路惩罚更弱)
-- 调小 `GA_ELITE`(已是 1,可保持或调到 0)
+- 调大 `GA_SHARING_SIGMA`(如 3.0)
+- 调小 `GA_ELITE`(可到 0)
 - 调大 `GA_POP_SIZE`(如 80-100)
-- 调小 `SEED_BOOST_ALPHA`(如 0.02,采样更均匀,低分积木也覆盖)
+- 调小 `SEED_BOOST_ALPHA`(如 0.02,采样更均匀)
 
-**想让采样更偏高分积木(开发已验证的好积木)**:
-- 调大 `SEED_BOOST_ALPHA`/`GA_IMMIGRANT_BOOST_ALPHA`(如 0.1-0.2,高分权重提升)
+**想偏开发已验证的好积木**:
+- 调大 `SEED_BOOST_ALPHA` / `GA_IMMIGRANT_BOOST_ALPHA`(如 0.1-0.2)
 
-**想让好句子多留几代(挖得更深)**:
+**想让好句子多留几代**:
 - 调大 `GA_MAX_AGE`(如 8-10)
 
 **想更激进防同化**:
 - 调小 `GA_MAX_AGE`(如 2-3)
 
 **换模型 / 换 API 服务商**:
-- 改 `llm_config.toml` 的 `base_url` / `api_key` / `[[score]]` 列表
-- 不用动代码
+- 改 `llm_config.toml` 的 `base_url` / `api_key` / `[[score]]`,不动代码。
 
-**调 gold 阈值(想更严/更松)**:
-- 改 `SCORE_THRESH`(如 7 更严,gold 更精)
+**调 gold 阈值**:
+- 改 `SCORE_THRESH`(如 7 更严)。
 
-**调种子源(想用更高/更低的积木)**:
-- 改 `SEED_MIN_SCORE`(如 6 只用高质量 pair 提取积木)
+**调积木采样偏向**:
+- 改 `SEED_BOOST_ALPHA`(高分积木权重更高; 调小→趋近纯均匀, 低分积木更容易采到)。积木池本身包含全部枚举 pair, 不再卡分数门槛。
+
+**觉得好句子被预筛误杀**:
+- 放宽 `GA_FLUENCY_SYSTEM` 的通顺判据(尤其长句)。
+
+**模型总脑补不相关的双关**:
+- 在 `SCORE_SYSTEM` 反幻觉自检段加反例。
 
 ---
 
-## 输出文件与数据格式
+## 输出文件
 
-所有产出在 `mined/`(gitignore,各自重挖):
+所有产出在 `mined/`(gitignore):
 
 | 文件/目录 | 说明 |
 |---|---|
-| `scored.jsonl` | 所有评分记录(全量,跨阶段累积)。GA 的种子源 + split_gold 的输入 |
-| `state.json` | 挖掘状态(断点续跑):seen_pairs/gold_pairs/游标/GA 种群(gold_pairs 持久化全部 max≥6 的金鹅语) |
+| `scored.jsonl` | 全量评分记录(跨阶段累积)。GA 种子源 + split_gold 输入 |
+| `state.json` | 挖掘状态:seen_pairs/gold_pairs/游标/GA 种群。gold_pairs 持久化全部 max≥6 |
 | `logs/run_<ts>.log` | 主日志(进度+结果,不含思维链) |
-| `logs/model_<ts>_<model>.log` | 各评分模型的思维链日志(tail -f 盯单模型) |
-| `gold_split/` | `split_gold.py` 生成的四类 gold 文件(手动跑脚本生成,不在挖矿时实时写) |
+| `logs/model_<ts>_<model>.log` | 各评分模型的思维链日志 |
+| `gold_split/` | `split_gold.py` 生成的四类 gold 文件 |
 
 ### 数据 schema
 
-**scored.jsonl**(一行一记录,全量已打分,是所有 gold 的源):
+**scored.jsonl**(一行一记录):
 ```json
 {"score": 8.0, "left": "义父", "right": "盗摄", "why": "...",
  "dir": "seed_ga", "round": 1, "scores": [8,9,7,8], "whys": ["..."]}
 ```
 - `score`:均分(float);`scores`:各模型分(int 列表)
 - `dir`:`fwd`/`rev`/`fixed`/`seed_ga`
-- `whys`:各模型的打分理由(对应 scores)
+- `whys`:各模型打分理由(对应 scores)
 
-**gold_split/*.jsonl**(split_gold.py 从 scored.jsonl 筛分生成,gold 格式):
+**gold_split/*.jsonl**(split_gold.py 筛分生成):
 ```json
 {"pair": "粪厂→实境", "score": 10.0, "scores": [10,10,10,10], "whys": ["..."]}
 ```
-- `gold_fixed.jsonl`:不动点神鹅语(left==right,max≥6)
-- `gold_short.jsonl`:短神鹅语(非不动点,≤2字,max≥6)
-- `gold_medium.jsonl`:中神鹅语(非不动点,3-4字,max≥5)
-- `gold_long.jsonl`:长神鹅语(非不动点,≥5字,max≥5)
+- `gold_fixed.jsonl`:不动点(left==right,max≥6)
+- `gold_short.jsonl`:非不动点 ≤2 字,max≥6
+- `gold_medium.jsonl`:非不动点 3-4 字,max≥5
+- `gold_long.jsonl`:非不动点 ≥5 字,max≥5
 
-**state.json**(断点续跑):
+**state.json**:
 - `seen_pairs` `[[left,right],...]` 已挖 pair(去重)
-- `gold_pairs` `[{S, real_goose_S, why, round, score, direction},...]` gold 库(全部 max≥6,持久化)
-- `n_iter` / `phase` / `cursor_bidict` / `cursor_full`:枚举阶段进度
+- `gold_pairs` `[{S, real_goose_S, why, round, score, direction},...]` gold 库
+- `n_iter` / `phase` / `cursor_bidict` / `cursor_full`:枚举进度
 - `ga_population` `[{s, scores, born},...]` GA 种群(跨 run 续)
 - `ga_epoch` GA 已跑 epoch 数
-- `ga_seen_s` `[str,...]` GA 评过的所有 S(防重烧 LLM)
+- `ga_seen_s` `[str,...]` GA 评过的 S
 
 ---
 
-## 辅助脚本
+## 脚本
 
 `scripts/`(独立工具,消费 `mined/scored.jsonl`):
 
 | 脚本 | 用途 |
 |---|---|
-| `split_gold.py` | 从 scored.jsonl 全量筛分生成四个 gold 文件(按均分降序)到 `mined/gold_split/`:`gold_fixed.jsonl`(不动点,max≥6)、`gold_short.jsonl`(非不动点 ≤2字,max≥6)、`gold_medium.jsonl`(非不动点 3-4字,max≥5)、`gold_long.jsonl`(非不动点 ≥5字,max≥5) |
-| `verify_e2e_mock.py` | **mock LLM 端到端验证**:不调真实 API,在 tmp 目标跑一遍 bidict→full→seed→采样覆盖→断点续传,验证改进后流程正确。开发改完算法后跑一遍回归 |
+| `split_gold.py` | 从 scored.jsonl 筛分生成四个 gold 文件到 `mined/gold_split/` |
+| `verify_full_e2e_mock.py` | mock LLM 完整端到端验证:真枚举 + 同一 state 贯穿三阶段 + 1000 轮 GA + 断电续传 |
 
 ```bash
-python scripts/split_gold.py        # 筛分生成四个 gold 文件到 mined/gold_split/
-python scripts/split_gold.py 20     # 同上 + 每类预览 top 20 到终端
-python scripts/verify_e2e_mock.py   # mock LLM 端到端验证 (不调真实 API, 不碰真实 mined/)
+python scripts/split_gold.py             # 筛分生成四个 gold 文件
+python scripts/split_gold.py 20          # 同上 + 每类预览 top 20
+python scripts/verify_full_e2e_mock.py   # mock e2e (真枚举+1000轮GA, ~7min, 不调真实 API)
 ```
 
 ---
@@ -351,8 +398,8 @@ python scripts/verify_e2e_mock.py   # mock LLM 端到端验证 (不调真实 API
 
 ```
 goose_digging/
-├── llm_config.toml.example   # 用户 LLM 配置模板 (复制改名用)
-├── llm_config.toml           # 你的真实配置 (gitignore, 自建)
+├── llm_config.toml.example   # LLM 配置模板 (复制改名用)
+├── llm_config.toml           # 真实配置 (gitignore)
 ├── README.md
 ├── LICENSE                   # MIT
 ├── pyproject.toml
@@ -362,29 +409,39 @@ goose_digging/
     │   └── __init__.py       # goose()/goose_char()/build_inverse()
     └── mining/
         ├── __main__.py       # CLI 入口
-        ├── config.py         # 全部可调参数 (knob)
+        ├── config.py         # 可调参数 (knob)
         ├── llm_config.py     # TOML 配置读取 + 覆盖默认
         ├── llm.py            # OpenAI 客户端 + 流式调用
-        ├── prompts.py        # 所有 system/user prompt
-        ├── fluency.py        # T1 通顺预筛 (两边都通才留)
-        ├── scoring.py        # T2 多模型 cross-check 评分
+        ├── prompts.py        # 所有 prompt (4 system + 2 user), 见「自定义 Prompt」
+        ├── fluency.py        # 通顺预筛
+        ├── scoring.py        # 多模型 cross-check 评分
         ├── enumerate.py      # 字典枚举 (bidict/full)
         ├── pipeline.py       # 三阶段编排
-        ├── seed.py           # GA 积木源 (字/词映射提取 + 近均匀 boost 采样)
+        ├── seed.py           # GA 积木源 (字/词映射提取 + 近均匀采样)
         ├── state.py          # state.json 持久化 (断点续跑)
         ├── finding.py        # Finding 数据类 + 导出
         ├── wordlist.py       # 静态词典 (7 源合并)
         ├── readability.py    # 字级 zipf 频率 (预筛用)
-        ├── ga/               # GA 神鹅语进化
+        ├── ga/               # GA 进化
         │   ├── genome.py     # 基因型 + 算子 (crossover/mutation/immigrant)
         │   ├── population.py # 种群 + fitness sharing + crowding + aging/evict
         │   ├── fitness.py    # 全模型 score_pairs 打分
         │   └── evolve.py     # 稳态 GA 主循环
-        └── tests/            # pytest (86 测, 全 mock LLM)
+        └── tests/            # pytest (80 测)
+            ├── test_goose.py   # oracle 表自洽 (goose_char/ungoose/roundtrip)
+            ├── test_mining.py  # 纯单测: prompt 格式 / 采样数学 / 惰性枚举 / state 持久化
+            ├── test_ga.py      # 纯单测: GA 算子 / 种群多样性 / 防同化 / 采样覆盖
+            └── test_e2e.py     # mock e2e: 三阶段串接 + GA + 断点续传 (秒级, 不调真实 API)
 ```
 
 ## 测试
 
 ```bash
-pytest goose_digging/tests/    # 86 测全过 (全 mock LLM, 不调真实 API)
+pytest goose_digging/tests/    # 80 测 (不调真实 API)
+#  test_goose.py  oracle 表自洽 (确定性)
+#  test_mining.py 纯单测: prompt 格式 / 采样数学 / 惰性枚举 / state 往返
+#  test_ga.py      纯单测: GA 算子 / 种群多样性 / 防同化 / 采样覆盖
+#  test_e2e.py     mock e2e: 三阶段串接 + GA + 断点续传 (秒级, mock LLM)
+python scripts/verify_full_e2e_mock.py   # 大规模 mock e2e (真枚举 + 1000 轮 GA, ~7min)
 ```
+

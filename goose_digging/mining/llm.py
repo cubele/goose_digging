@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """DeepSeek 客户端 + 流式对话调用 + 结构化 debug 日志.
 
-关键 (踩坑总结): 部分 LLM (如 DeepSeek-R/V 系列, GLM, Qwen-Max) 是 reasoning 模型.
+关键约束: 部分 LLM (如 DeepSeek-R/V 系列, GLM, Qwen-Max) 是 reasoning 模型.
   - 不能设 max_tokens: 设了会把 reasoning 耗光导致 content 为空 (finish=length).
   - JSON 输出用 extra_body={"response_format":{"type":"json_object"}},
     但模型常返回数组, 解析端容错 (见 jsonx).
@@ -49,12 +49,12 @@ def llm_chat(client: openai.OpenAI, model: str, system: str, user: str,
     thinking: 是否开 reasoning. 简单任务关掉省 80x 时间+token; 需要联想/评判的才开.
     temperature: LLM 采样温度. None=API 默认. 造句可升高提升创造力.
     logger: 流式 channel (一般传 Logger.stream). reasoning/content 实时喂给它,
-            落盘 run_*.log. 若为 None, 静默 (并行 T1 用).
+            落盘 run_*.log. 若为 None, 静默 (并行预筛用).
     debug_writer: 兜底 debug 文件 writer (每段含 token/预览); None 则不写.
     """
     tag = f"[{label}] " if label else ""
     if logger is None:
-        logger = lambda s: None  # 静默 (并行 T1 传 None 吞日志; 勿退化 stdout, 否则多路交错乱码)
+        logger = lambda s: None  # 静默 (并行预筛传 None 吞日志; 勿退化 stdout, 否则多路交错乱码)
 
     extra = {"response_format": {"type": "json_object"}}
     if not thinking:

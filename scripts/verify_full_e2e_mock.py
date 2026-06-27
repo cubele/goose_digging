@@ -35,7 +35,7 @@ from goose_digging.mining import config, state, pipeline  # noqa: E402
 from goose_digging.mining.llm import ModelLogger  # noqa: E402
 from goose_digging.mining.log import Logger  # noqa: E402
 
-N_GA_EPOCHS = 1000
+N_GA_EPOCHS = 60           # GA 轮数. offspring=220 后每轮 ~3.4s (mock), 60轮≈3min 够验证续传/gold/多样性
 BIDICT_WORD_LIMIT = 50000   # bidict 阶段跑前 5万词 (167万全扫描要几分钟, 验证够用)
 FULL_WORD_LIMIT = 5000      # full 阶段跑前 5000 词
 
@@ -75,12 +75,8 @@ def install_mock(monkey):
     def fake_fluency(client, model, system, user, **kw):
         _calls["n"] += 1
         texts = re.findall(r'\d+\. (.+)', user)
-        items = []
-        for t in texts:
-            if not t:
-                continue
-            ok = not any(b in t for b in ("乱", "码", "硬", "拼"))
-            items.append({"text": t, "ok": bool(ok)})
+        # 真实单边通顺率 ~28% (GA pair 存活 8% = 双边都通 = p², p≈28%). hash 判通, 确定性可复现.
+        items = [{"text": t, "ok": (hash(t) % 100) < 28} for t in texts if t]
         return json.dumps({"items": items}, ensure_ascii=False)
 
     from goose_digging.mining import scoring, fluency
@@ -112,7 +108,6 @@ def run():
     print("=" * 72)
     print("完整 e2e (mock): 真枚举 + bidict前" + str(BIDICT_WORD_LIMIT) + "词 + full前" + str(FULL_WORD_LIMIT) + "词 + " + str(N_GA_EPOCHS) + "轮GA")
     print("=" * 72)
-
     monkey = {}
     install_mock(monkey)
     mls = make_loggers(out_dir)
@@ -122,15 +117,16 @@ def run():
 
     try:
         st = state.MiningState()
+        from goose_digging.mining import enumerate as enum_mod
 
         # ====== 阶段 1: bidict 真枚举 (前 N 词) ======
         print("\n[1/3] bidict 真枚举(惰性) + 评分 (前" + str(BIDICT_WORD_LIMIT) + "词)...")
         t_b = time.time()
-        bidict_pairs = pipeline_enum_bidict()
+        bidict_pairs = enum_mod.enumerate_both_in_dict()
         print("  词表: " + str(len(bidict_pairs)) + " (惰性, 跑前 " + str(BIDICT_WORD_LIMIT) + ")")
         n_iter = 0
         while st.cursor_bidict < BIDICT_WORD_LIMIT and st.cursor_bidict < len(bidict_pairs):
-            pipeline.iterate(None, st, bidict_pairs, log, skip_T1=True,
+            pipeline.iterate(None, st, bidict_pairs, log, skip_fluency=True,
                              phase="bidict", model_loggers=mls,
                              out_dir=out_dir, state_path=sp)
             n_iter += 1
@@ -138,13 +134,13 @@ def run():
               ", gold=" + str(len(st.gold_pairs)) + " (" + str(round(time.time() - t_b, 1)) + "s)")
 
         # ====== 阶段 2: full 真枚举 (前 N 词) ======
-        print("\n[2/3] full 真枚举(惰性) + T1 + 评分 (前" + str(FULL_WORD_LIMIT) + "词)...")
+        print("\n[2/3] full 真枚举(惰性) + 预筛 + 评分 (前" + str(FULL_WORD_LIMIT) + "词)...")
         t_f = time.time()
-        full_pairs = pipeline_enum_full()
+        full_pairs = enum_mod.enumerate_pairs()
         print("  词表: " + str(len(full_pairs)) + " (惰性, 跑前 " + str(FULL_WORD_LIMIT) + ")")
         n_iter = 0
         while st.cursor_full < FULL_WORD_LIMIT and st.cursor_full < len(full_pairs):
-            pipeline.iterate(None, st, full_pairs, log, skip_T1=False,
+            pipeline.iterate(None, st, full_pairs, log, skip_fluency=False,
                              phase="full", model_loggers=mls,
                              out_dir=out_dir, state_path=sp)
             n_iter += 1
@@ -241,18 +237,6 @@ def run():
     print("PASS 完整 e2e (真枚举 + 1000轮GA + 三阶段串接 + 断电续传)")
     shutil.rmtree(tmp, ignore_errors=True)
     return 0
-
-
-def pipeline_enum_bidict():
-    """真 enumerate_both_in_dict (惰性)."""
-    from goose_digging.mining import enumerate as enum_mod
-    return enum_mod.enumerate_both_in_dict()
-
-
-def pipeline_enum_full():
-    """真 enumerate_pairs (惰性)."""
-    from goose_digging.mining import enumerate as enum_mod
-    return enum_mod.enumerate_pairs()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # --- 敏感 (勿入库) ---
-llm_config.toml        # 用户真实 LLM 配置 (含 api_key), 复制自 .toml.example
+llm_config.toml
 
 # --- 挖掘产物 (各自重挖, 不入库) ---
 mined/

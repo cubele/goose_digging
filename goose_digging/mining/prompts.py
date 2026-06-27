@@ -1,17 +1,34 @@
 # -*- coding: utf-8 -*-
-"""所有 prompt 集中在这 (system 字符串 + user prompt 构造函数).
+"""所有 prompt 集中在此 (system 字符串 + user prompt 构造函数).
 
-改 prompt 文案只来这, 改参数(模型/阈值/batch)去 config.py.
+改文案改这里, 改参数(模型/阈值/batch)去 config.py.
+模型走 llm_config.toml, prompt 走代码. 详见 README "自定义 Prompt".
 
-user prompt 函数:
-  fluency_prompt      T1 通顺预筛的 user prompt
-  score_prompt        T2 关系评分的 user prompt
+system 字符串:
+  FLUENCY_SYSTEM      通顺判, 枚举阶段 (三选一: 词典/解释得通/可成句)
+  GA_FLUENCY_SYSTEM   通顺判, GA 阶段 (更宽松: 产生联想即通顺)
+  SCORE_SYSTEM        评分, 枚举阶段
+  SEED_SCORE_SYSTEM   评分, GA 阶段 (通顺权重更高)
 
-system 字符串 (按阶段):
-  FLUENCY_SYSTEM      T1 通顺判 (枚举阶段, 宽松三选一: 词典/解释得通/可成句)
-  GA_FLUENCY_SYSTEM   T1 通顺判 (GA 阶段, 更宽松: 能解释得通产生联想即可)
-  SCORE_SYSTEM        T2 主评分 (枚举阶段)
-  SEED_SCORE_SYSTEM   T2 seed/GA 评分 (通顺权重更高, 防双关诱导)
+user prompt 函数 (拼 user message, 要模型回结构化 JSON):
+  fluency_prompt      通顺预筛
+  score_prompt        关系评分
+
+调用链:
+  枚举 full  : fluency_filter(FLUENCY_SYSTEM) → score_pairs(SCORE_SYSTEM)
+  枚举 bidict: 跳过预筛 → score_pairs(SCORE_SYSTEM)
+  GA         : fluency_filter(GA_FLUENCY_SYSTEM) → score_offspring(SEED_SCORE_SYSTEM)
+
+改文案的约束:
+1. JSON 契约. 解析端 (jsonx.parse_json_list + shared.parse_scores) 取最外层数组,
+   按 key 名 text/ok/left/score/why 取值. 两个 user prompt 要求的格式:
+     fluency_prompt → {"items": [{"text": "原词", "ok": true或false}]}
+     score_prompt   → {"scores": [{"left": "原左", "score": 0-10, "why": "..."}]}
+   score 必须 0-10, left/text+ok 做一一对应 (缺了 key 该候选被丢弃). why 可删.
+2. 正反例. SCORE_SYSTEM 中 软件→起凤=1 (防脑补)、奶奶瞪鸡冲奶位≤2 (防字硬拼) 等反例
+   约束模型打分方向, 改文案时保留.
+3. 批量数量对齐. user prompt 要求 "N 条一一对应", 防模型漏回 (输出截断会少条).
+   解析端有校验/重试(预筛)/报警(评分), 但 prompt 层需先保证这点.
 """
 
 
@@ -19,13 +36,13 @@ system 字符串 (按阶段):
 # system 字符串
 # ===========================================================================
 
-# T1 通顺预筛 (枚举阶段). 判据宽松: 三选一即通顺 ——
+# 通顺预筛 (枚举阶段). 判据宽松: 三选一即通顺 ——
 #   (a) 在词典里 / 真实词
 #   (b) 是一个解释得通的词语 (谐音/口语/俚语/略不规范但讲得通也算)
 #   (c) 可以作为句子的一部分 (能塞进一句话里说得通)
 # 设计动机: 神鹅语的反差常出现在「单看不是标准词, 但放进句子能读通」的边角
 # (如 赶班/撬松/握你弟). 严格判"通顺可懂"会误杀这些金子. 放宽到"讲得通"即可,
-# 把"是否真神鹅语"的判别完全交给 T2 评分 (T1 只砍明显乱码/字硬拼). 词典命中由
+# 把"是否真神鹅语"的判别完全交给评分 (预筛只砍明显乱码/字硬拼). 词典命中由
 # fluency_filter 字典短路 (零 LLM), 这里只判词典外的串.
 FLUENCY_SYSTEM = """你判断一个中文短语是不是"讲得通". 只回JSON.
 
@@ -184,7 +201,7 @@ SCORE_SYSTEM = """你是神鹅语评委. 神鹅语 = pair (左, 右), 右=goose(
 # user prompt 构造函数
 # ===========================================================================
 def fluency_prompt(strs: list[str]) -> str:
-    """T1: 批量判断每个短语"讲得通不通" (三选一即通顺), 给便宜模型.
+    """通顺预筛: 批量判断每个短语"讲得通不通" (三选一即通顺), 给便宜模型.
 
     strs: 待判短语列表 (一个 pair 的 left/right 拆开混在一起).
     判据宽松: 在词典里/真实词, 或解释得通的词语 (谐音/口语), 或能作为句子的一部分, 任一即通顺.
@@ -207,7 +224,7 @@ def fluency_prompt(strs: list[str]) -> str:
 
 
 def score_prompt(pairs: list[dict]) -> str:
-    """T2: 关系评分. 前提是两边都已通过 T1 通顺预筛, 这里只判关系神不神.
+    """关系评分. 前提是两边都已通过通顺预筛, 这里只判关系神不神.
 
     pairs 每条 {left, right}. 返回 0-10 分 + why.
     """

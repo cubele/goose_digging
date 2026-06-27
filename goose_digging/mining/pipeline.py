@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""挖掘管线主循环: T1 攒批 → T2 多模型评分 → 全量落盘.
+"""挖掘管线主循环: 通顺预筛攒批 → 多模型评分 → 全量落盘.
 
 两条路径:
-  iterate      枚举驱动 (字典双向候选 → T1 → T2), 覆盖短词.
-  iterate_seed 种子发掘 (scored.jsonl→字映射→LLM造长句→T2), 覆盖长句.
+  iterate      枚举驱动 (字典双向候选 → 预筛 → 评分), 覆盖短词.
+  iterate_seed 种子发掘 (scored.jsonl→字映射→LLM造长句→评分), 覆盖长句.
 
 输出 (mined/):
   scored.jsonl   所有评过分的 pair (含低分) + 各模型分, 全量追加.
@@ -22,7 +22,7 @@ import openai
 from .log import Logger
 from .finding import Finding
 from .state import MiningState
-from .config import SCORE_THRESH, SCORE_BATCH, T1_FETCH, T1_PARALLEL, STAR_TOP_OFFSET
+from .config import SCORE_THRESH, SCORE_BATCH, FLUENCY_FETCH, FLUENCY_PARALLEL, STAR_TOP_OFFSET
 from .prompts import SEED_SCORE_SYSTEM
 from .fluency import fluency_filter
 from .scoring import score_pairs
@@ -96,7 +96,7 @@ def _score_and_log(client, survivors, rnd, state, stream, debug_writer,
                    model_loggers: dict[str, ModelLogger] | None = None,
                    tag="", system: str | None = None,
                    out_dir: Path | None = None, state_path: Path | None = None):
-    """共用: T2 评分 + 入 gold + 日志 + 全量落盘. 返回 findings.
+    """共用: 评分 + 入 gold + 日志 + 全量落盘. 返回 findings.
 
     system: 覆默认 SCORE_SYSTEM (seed 用 SEED_SCORE_SYSTEM, 通顺门槛更严).
     评分后立即全量落盘 (scored.jsonl), 含所有 pair 的 score/why + 各模型分.
@@ -127,38 +127,38 @@ def _score_and_log(client, survivors, rnd, state, stream, debug_writer,
 
 
 def iterate(client: openai.OpenAI, state: MiningState,
-            all_pairs: list[dict], log: Logger, skip_T1: bool,
+            all_pairs: list[dict], log: Logger, skip_fluency: bool,
             debug_writer: Callable[[str], None] | None = None,
             phase: str = "bidict",
             model_loggers: dict[str, ModelLogger] | None = None,
             out_dir: Path | None = None, state_path: Path | None = None) -> list[Finding]:
-    """枚举驱动迭代 -> T2 -> gold.
+    """枚举驱动迭代 -> 评分 -> gold.
 
-    skip_T1=True (bidict): 直接取 SCORE_BATCH 候选进 T2 (双边词典已自带通顺保证).
-    skip_T1=False (full):  T1 持续筛候选, 攒满 SCORE_BATCH 存活才进 T2.
+    skip_fluency=True (bidict): 直接取 SCORE_BATCH 候选进评分 (双边词典已自带通顺保证).
+    skip_fluency=False (full):  通顺预筛持续筛候选, 攒满 SCORE_BATCH 存活才进评分.
     phase: "bidict" | "full", 决定读哪个 cursor.
     model_loggers: 一个 run 复用的一组 ModelLogger, 透传给 _score_and_log.
     """
     stream = log.stream
     rnd = state.n_iter + 1
     cur = _cursor_of(state, phase)
-    goal = f"T1攒满{SCORE_BATCH}存活进T2" if not skip_T1 else f"取{SCORE_BATCH}候选直接进T2"
+    goal = f"预筛攒满{SCORE_BATCH}存活进评分" if not skip_fluency else f"取{SCORE_BATCH}候选直接进评分"
     log.log(f"\n{'='*72}\n[iter {rnd} {phase}]  {goal}"
             f"  cursor={cur}/{len(all_pairs)}  gold={len(state.gold_pairs)}\n{'='*72}")
 
-    if not skip_T1:
+    if not skip_fluency:
         survivors: list[dict] = []
-        t1_rounds = 0
+        fluency_rounds = 0
         n_judged = 0  # 累计已判候选数 (进 fluency_filter 的)
-        # 并行 T1: 每轮预取 T1_PARALLEL 个 FETCH 批, 并行判通顺, 合并存活.
+        # 并行预筛: 每轮预取 FLUENCY_PARALLEL 个 FETCH 批, 并行判通顺, 合并存活.
         # 通顺判不依赖顺序 (短语独立), 可安全并行.
         while len(survivors) < SCORE_BATCH and cur < len(all_pairs):
-            # 预取本轮的并行批 (每批 T1_FETCH, 共 T1_PARALLEL 批)
+            # 预取本轮的并行批 (每批 FLUENCY_FETCH, 共 FLUENCY_PARALLEL 批)
             batches = []
-            for _ in range(T1_PARALLEL):
+            for _ in range(FLUENCY_PARALLEL):
                 if cur >= len(all_pairs):
                     break
-                batch = _next_batch(state, all_pairs, T1_FETCH, phase)
+                batch = _next_batch(state, all_pairs, FLUENCY_FETCH, phase)
                 cur = _cursor_of(state, phase)
                 if not batch:
                     break
@@ -167,7 +167,7 @@ def iterate(client: openai.OpenAI, state: MiningState,
                 batches.append(batch)
             if not batches:
                 break
-            t1_rounds += 1
+            fluency_rounds += 1
             # 并行判通顺: 各批的详细日志吞掉 (不进主 stream), 只让主 stream 收轮汇总.
             # (否则 5 批同时往 stream 写, 词典命中/送LLM/存活行全交错乱套)
             _noop = lambda _s: None  # 静默 logger: 并行批的详细日志吞掉, 避免 5 路交错乱码
@@ -179,14 +179,14 @@ def iterate(client: openai.OpenAI, state: MiningState,
                 n_judged += len(b)
                 survivors.extend(res)
             new_surv = sum(len(r) for r in results)
-            log.log(f"  T1第{t1_rounds}轮: 并行判{len(batches)}批×{T1_FETCH} "
+            log.log(f"  预筛第{fluency_rounds}轮: 并行判{len(batches)}批×{FLUENCY_FETCH} "
                     f"存活+{new_surv} 累计存活{len(survivors)}/{SCORE_BATCH} "
                     f"cursor={cur}/{len(all_pairs)}")
         total = len(all_pairs)
         remain = total - cur
         rate = len(survivors) / n_judged * 100 if n_judged else 0
-        log.log(f"  T1完成({t1_rounds}轮): 已判{n_judged}/{total} 剩{remain} "
-                f"存活{len(survivors)} (存活率{rate:.0f}%) -> T2评分")
+        log.log(f"  预筛完成({fluency_rounds}轮): 已判{n_judged}/{total} 剩{remain} "
+                f"存活{len(survivors)} (存活率{rate:.0f}%) -> 评分")
     else:
         batch = _next_batch(state, all_pairs, SCORE_BATCH, phase)
         for p in batch:
@@ -208,7 +208,7 @@ def iterate_seed(client: openai.OpenAI, state: MiningState,
                  debug_writer: Callable[[str], None] | None = None,
                  model_loggers: dict[str, ModelLogger] | None = None,
                  out_dir: Path | None = None, state_path: Path | None = None) -> list[Finding]:
-    """种子发掘迭代: GA 神鹅语进化 (全模型直接打分, 废弃 surrogate).
+    """种子发掘迭代: GA 神鹅语进化 (全模型直接打分).
 
     scored.jsonl→字/词映射积木(近均匀采样)→GA进化(全模型 score_pairs 打分)→goose校验→gold/落盘.
     GA 内部已跑完全模型 cross-check, 本函数直接落 GA 返回的 findings/gold_hits.
@@ -217,15 +217,15 @@ def iterate_seed(client: openai.OpenAI, state: MiningState,
     model_loggers: 一个 run 复用的一组 ModelLogger, 透传给 GA 打分.
     """
     from . import seed as seed_mod
-    from .config import SEED_MIN_SCORE, OUT_DIR as _DEFAULT_OUT
+    from .config import OUT_DIR as _DEFAULT_OUT
     stream = log.stream
     rnd = state.n_iter + 1
-    seed_pairs = seed_mod.load_seed_pairs(SEED_MIN_SCORE, out_dir=out_dir)
+    seed_pairs = seed_mod.load_seed_pairs(out_dir=out_dir)
     # 全局已评 S (GA 专属): 防 GA 重新生成已评过的 S 烧 LLM.
     # 用 state.ga_seen_s 持久化 (跨 run 防重烧); evolve 原地往里加本 epoch 新评的 S.
     seen_s = set(state.ga_seen_s)
     log.log(f"\n{'='*72}\n[iter {rnd} 种子发掘(GA)]  种子{len(seed_pairs)}对"
-            f"(score>={SEED_MIN_SCORE})  进化{n_gen} offspring  "
+            f"  进化{n_gen} offspring  "
             f"种群{len(state.ga_population)}/epoch{state.ga_epoch}  已评S={len(seen_s)}\n{'='*72}")
 
     result = seed_mod.gen_ga_candidates(
@@ -274,7 +274,7 @@ def iterate_seed(client: openai.OpenAI, state: MiningState,
     state.save(path=state_path)
     if result.stats:
         log.log(f"  [GA] offspring={result.stats.get('offspring')} "
-                f"t1_killed={result.stats.get('t1_killed')} "
+                f"fluency_killed={result.stats.get('fluency_killed')} "
                 f"scored={result.stats.get('scored')} gold={result.stats.get('gold')} "
                 f"diversity={result.stats.get('diversity')}")
     return findings

@@ -13,7 +13,7 @@
 比值 ~1.4:1, 几乎均匀. GA 的 immigrant/mutation 算子每次用不同随机种子 (基于 epoch 号).
 
 本模块提供积木源 (extract_*/sample_*), GA 主循环在 mining/ga/evolve.py:
-  1. load_seed_pairs: 从 scored.jsonl 读 score>=min 的 pair
+  1. load_seed_pairs: 从 scored.jsonl 读全部枚举 pair (不卡分数, 高低分都进)
   2. extract_char_maps / extract_word_maps: 拆字映射 + 词映射, 带原始信号
   3. sample_char_maps / sample_word_maps: 近均匀 boost 采样 (GA immigrant/mutation 算子用)
   4. gen_ga_candidates: 编排 GA 进化 → 全模型打分 → gold/落盘 (见 mining/ga/evolve.py)
@@ -136,17 +136,17 @@ def sample_word_maps(word_maps: list[tuple[str, str, float]], k: int,
 
 # ---- 种子加载 ----
 
-def load_seed_pairs(min_score: float | None = None,
-                  out_dir=None) -> list[dict]:
+def load_seed_pairs(out_dir=None) -> list[dict]:
     """从 scored.jsonl 读枚举路径评过分的 pair (fwd/rev/fixed), 当造句积木.
 
-    排除 dir 以 "seed" 开头的 pair (造句产物, 可能含乱码, 喂回去会污染采样恶性循环).
-    min_score 默认用 config.SEED_MIN_SCORE.
+    排除 dir 以 "seed" 开头的 pair (GA 造句产物, 喂回去会污染采样恶性循环).
+    **不做分数过滤** —— 全部 pair 都进池: 低分 pair 单看平淡, 但塞进长句后可能撞出
+    高分反差 (低分积木成句后可能反而高分), 只采高分积木会漏掉这类组合. 高低分之间的
+    权重区分交给下游 sample_char_maps/sample_word_maps 的近均匀 boost 采样 (低分低频
+    也尽量采, 保证完整覆盖), 而不是在这里硬卡分数门槛丢掉.
     """
-    from .config import OUT_DIR, SEED_MIN_SCORE
+    from .config import OUT_DIR
     import json
-    if min_score is None:
-        min_score = SEED_MIN_SCORE
     sp = (out_dir or OUT_DIR) / "scored.jsonl"
     if not sp.exists():
         return []
@@ -163,8 +163,7 @@ def load_seed_pairs(min_score: float | None = None,
             d = json.loads(line)
             if str(d.get("dir", "")).startswith("seed"):  # seed / seed_<model> 都排除
                 continue
-            if d.get("score", 0) >= min_score:
-                out.append(d)
+            out.append(d)
     return out
 
 
@@ -196,16 +195,15 @@ def gen_ga_candidates(client: openai.OpenAI,
     out_dir: scored.jsonl 所在目录 (积木来源, 默认 config.OUT_DIR).
     """
     from .ga.evolve import evolve
-    from .config import SEED_MIN_SCORE, OUT_DIR as _DEFAULT_OUT, LOG_DIR
+    from .config import OUT_DIR as _DEFAULT_OUT, LOG_DIR
     import random as _rng
     od = out_dir or _DEFAULT_OUT
-    seed_pairs = load_seed_pairs(SEED_MIN_SCORE, out_dir=od)
+    seed_pairs = load_seed_pairs(out_dir=od)
     all_chars = extract_char_maps(seed_pairs)
     all_words = extract_word_maps(seed_pairs)
     if len(all_chars) < 3 or len(all_words) < 3:
         if logger:
-            logger(f"\n  [GA] 种子太少 (字映射{len(all_chars)}/词映射{len(all_words)}, "
-                   f"score>={SEED_MIN_SCORE}), 跳过\n")
+            logger(f"\n  [GA] 种子太少 (字映射{len(all_chars)}/词映射{len(all_words)}), 跳过\n")
         return None
     rng = _rng.Random(iter_seed)
     return evolve(client, seed_pairs, all_chars, all_words, n, iter_seed,
