@@ -73,8 +73,6 @@ GA_TOURNAMENT_K = 3       # 锦标赛选父大小 (小=多探索, 大=偏开发)
 GA_ELITE = 1              # 精英保留数. 调小→防收敛, 给新生更多机会
 GA_SHARING_SIGMA = 2.5    # fitness sharing 邻域半径 (Levenshtein 距离); 调大→相似套路惩罚适度放宽
                           #   配合均匀采样让高分长句即使相似也能多留几代
-GA_SCORE_BATCH = 12       # 全模型 score_pairs 一次喂多少 offspring. 对齐每 epoch 存活数 (~12),
-                          #   一次 round-trip 打完, 单批不过大 (避免服务端 length 截断).
 GA_IMMIGRANT_BOOST_ALPHA = 0.05  # 移民算子近均匀采样 boost 系数 (复用 seed 加性 boost 思路)
 GA_GEN_TAG = "seed_ga"    # GA 产物落 scored.jsonl 的 dir 标签 (load_seed_pairs 按 seed 前缀排除, 不喂回)
 # --- 防同化 / 防重复 (核心: 已挖鹅语存档后移出种群, 让种群永远留给探索中的个体) ---

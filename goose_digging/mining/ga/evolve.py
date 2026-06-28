@@ -37,7 +37,7 @@ from ..config import (
     GA_IMMIGRANT_BOOST_ALPHA, SEED_MIN_LEN, SEED_MAX_LEN,
     SEED_N_CHARS, SEED_N_WORDS, SEED_BOOST_ALPHA,
     WORD_MAP_LEN, SCORE_THRESH, GA_MAX_AGE, GA_EVICT_PROMOTED,
-    GA_EVICT_SCORE_THRESH, GA_SCORE_BATCH,
+    GA_EVICT_SCORE_THRESH,
 )
 from ..finding import Finding
 from ..llm import ModelLogger
@@ -261,26 +261,26 @@ def evolve(client: openai.OpenAI,
                               "fluency_killed": n_fluency_killed})
 
     # 4. 全模型 score_pairs 直接打分 (fitness = 全模型均分)
-    #    分批喂 (GA_SCORE_BATCH), 避免单批过大导致模型输出截断.
+    #    一把全评, 不子分批: 存活数受 fluency 自然约束 (~十几个, 实测峰值几十),
+    #    远低于输出截断风险线, 同 full 模式 (full 攒满 SCORE_BATCH 后一把评几十条也安全).
+    #    旧实现按 GA_SCORE_BATCH 切批会把零头 (如 13→12+1) 拆成两次 round-trip 白烧 API.
     result_all = ScoreResult([], [], {})
-    for i in range(0, len(dedup), GA_SCORE_BATCH):
-        chunk = dedup[i:i + GA_SCORE_BATCH]
-        res = score_offspring(client, chunk, rnd, logger, debug_writer,
-                              model_loggers=model_loggers)
-        result_all.findings.extend(res.findings)
-        result_all.gold_hits.extend(res.gold_hits)
-        result_all.per_pair.update(res.per_pair)
-        # 把全模型分回填到 individual.scores (= 它的 fitness)
-        by_left = {f.S: f for f in res.findings}
-        for ind in chunk:
-            f = by_left.get(ind.s)
-            pps = res.per_pair.get(ind.s)
-            if pps and pps.get("scores"):
-                ind.scores = list(pps["scores"])
-                seen_s.add(ind.s)   # 全局记录: 已评
-            elif f:
-                ind.scores = [int(round(f.score))]  # 兜底
-                seen_s.add(ind.s)
+    res = score_offspring(client, dedup, rnd, logger, debug_writer,
+                          model_loggers=model_loggers)
+    result_all.findings.extend(res.findings)
+    result_all.gold_hits.extend(res.gold_hits)
+    result_all.per_pair.update(res.per_pair)
+    # 把全模型分回填到 individual.scores (= 它的 fitness)
+    by_left = {f.S: f for f in res.findings}
+    for ind in dedup:
+        f = by_left.get(ind.s)
+        pps = res.per_pair.get(ind.s)
+        if pps and pps.get("scores"):
+            ind.scores = list(pps["scores"])
+            seen_s.add(ind.s)   # 全局记录: 已评
+        elif f:
+            ind.scores = [int(round(f.score))]  # 兜底
+            seen_s.add(ind.s)
 
     # 5. crowding 替换入种群 (max_age 让超龄精英可被替).
     #    跳过已达 gold 的个体: 它们马上要被 evict, 先占位再腾位是白塞.
